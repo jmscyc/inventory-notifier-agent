@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-【本地全功能整合版 - Web 控制台 + 瀏覽器本機通知 + Telegram 雙軌庫存監控系統】
+【本地全功能整合版 - Web 控制台 + 自動加車/自動結帳 + 桌面推播 + Telegram 雙軌庫存監控系統】
 
-特色亮點：
-1. 本地 Web UI 儀表板 (瀏覽器開啟 http://localhost:8000)
-   - 可直接新增追蹤網址、查看即時清單、手動單鍵重爬、刪除商品
-   - 視覺化設定【背景掃描週期】與【缺貨回報頻率】
-   - 支援【本機桌面/瀏覽器推播通知 (HTML5 Web Notifications)】及音效提示
-   - 支援隨時開啟/關閉 Telegram 通知
-2. Telegram Bot 雙軌並行 (若不想用 Telegram，亦可在網頁端設定開關)
-3. 單一檔案直接執行，零複雜依賴！
-
-執行方式：
-   pip install fastapi uvicorn httpx beautifulsoup4 python-dotenv
-   python3 run_local_app.py
+功能特點：
+1. 階梯式自動加車與自動結帳 (Auto-Cart & Auto-Checkout):
+   - 第一階段：補貨時自動以 Cookie / 帳號加入購物車，推播「已為您自動放入購物車！請在 15 分鐘內點此完成結帳」
+   - 第二階段：支援一鍵直達結帳確認頁面，或自動推進至付款確認頁
+   - 容錯保護：每一段失敗至少保留前段正常執行，並提供即時推播通知
+2. 現代化 Web UI 控制台 (http://localhost:8000)
+3. 支援 HTML5 桌面推播通知與 Telegram 雙軌通知
+4. 單一檔案直接在本地端執行，零雲端依賴！
 """
 
 import asyncio
@@ -33,6 +29,14 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
+
+from app.autobuy_module import (
+    execute_autobuy_flow,
+    load_autobuy_config,
+    save_autobuy_config,
+    load_saved_cookies,
+    save_cookies,
+)
 
 load_dotenv()
 
@@ -60,7 +64,6 @@ def load_config() -> dict:
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-            # 填補可能缺失的欄位
             for k, v in DEFAULT_CONFIG.items():
                 if k not in cfg:
                     cfg[k] = v
@@ -77,7 +80,7 @@ def save_config(cfg: dict):
 
 APP_CONFIG = load_config()
 NOTIFY_STATE = {}
-RECENT_LOCAL_NOTIFICATIONS = []  # 供前端輪詢讀取的通知事件佇列
+RECENT_LOCAL_NOTIFICATIONS = []
 
 def load_tracked_items() -> list:
     if not DATA_FILE.exists():
@@ -141,7 +144,7 @@ def delete_item(item_id: str) -> bool:
 
 
 # =====================================================================
-# 2. 核心爬蟲檢測模組
+# 2. 核心爬蟲檢測模組 (精準判定 Costco / 一般電商)
 # =====================================================================
 
 def check_product_inventory(url: str) -> dict:
@@ -260,8 +263,8 @@ def is_quiet_hours() -> bool:
     now_taipei = datetime.datetime.now(TAIPEI_TZ)
     return 1 <= now_taipei.hour < 5
 
-async def broadcast_notification(client: Optional[httpx.AsyncClient], title: str, body: str, target_url: str = ""):
-    # 1. 登記到本機推播事件佇列（前端輪詢觸發瀏覽器通知）
+async def broadcast_notification(client: Optional[httpx.AsyncClient], title: str, body: str, target_url: str = "", button_text: str = "🛒 前往商品頁面"):
+    # 1. 登記到本機推播佇列
     if APP_CONFIG.get("enable_local_notification", True):
         event = {
             "id": f"notif_{int(time.time() * 1000)}",
@@ -271,7 +274,6 @@ async def broadcast_notification(client: Optional[httpx.AsyncClient], title: str
             "timestamp": datetime.datetime.now(TAIPEI_TZ).strftime("%H:%M:%S")
         }
         RECENT_LOCAL_NOTIFICATIONS.append(event)
-        # 最多保留 30 筆
         if len(RECENT_LOCAL_NOTIFICATIONS) > 30:
             RECENT_LOCAL_NOTIFICATIONS.pop(0)
 
@@ -289,7 +291,7 @@ async def broadcast_notification(client: Optional[httpx.AsyncClient], title: str
             }
             if target_url:
                 payload["reply_markup"] = {
-                    "inline_keyboard": [[{"text": "🛒 前往商品頁面", "url": target_url}]]
+                    "inline_keyboard": [[{"text": button_text, "url": target_url}]]
                 }
             try:
                 await client.post(api_url, json=payload, timeout=10.0)
@@ -310,7 +312,6 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
     now_ts = time.time()
     now_str = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-    # 更新本地檔案
     add_or_update_item(name=crawl_res.get("title") or name, target_url=target_url, in_stock=in_stock, status_notes=status_desc, item_id=item_id)
 
     state = NOTIFY_STATE.get(item_id, {"last_notified_stock": None, "last_notified_time": 0})
@@ -320,6 +321,8 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
     should_send = False
     notify_title = ""
     notify_body = ""
+    action_url = target_url
+    btn_text = "🛒 前往商品頁面"
 
     poll_interval = APP_CONFIG.get("poll_interval_minutes", 5)
     oos_hours = APP_CONFIG.get("oos_notify_hours", 4)
@@ -327,8 +330,12 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
     if is_manual:
         should_send = True
         if in_stock:
-            notify_title = "🎉 **【手動更新：商品有現貨！】**"
-            notify_body = f"📦 **商品**：{name}\n🟢 目前狀態：{status_desc}\n快前往賣場把握搶購！"
+            # 觸發搶購流水線
+            flow_res = await execute_autobuy_flow(target_url, name)
+            notify_title = flow_res["status_title"]
+            notify_body = flow_res["status_message"]
+            action_url = flow_res["action_url"]
+            btn_text = flow_res["action_button_text"]
         else:
             notify_title = "ℹ️ **【手動更新：目前依然缺貨中】**"
             notify_body = f"📦 **商品**：{name}\n🔴 目前狀態：{status_desc}\n系統維持每 {poll_interval} 分鐘自動監控！"
@@ -337,16 +344,21 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
             NOTIFY_STATE[item_id] = {"last_notified_stock": last_notified_stock, "last_notified_time": last_notified_time}
             return
 
-        # 補貨上架：缺貨 -> 有貨
+        # 補貨上架：缺貨 -> 有貨 (觸發階梯式自動加車與結帳流水線！)
         if in_stock and (last_notified_stock is not True):
             should_send = True
-            notify_title = "🎉 **【好消息！商品補貨上架】**"
-            notify_body = f"📦 **商品**：{name}\n🟢 **狀態**：{status_desc}\n⏰ **時間**：`{now_str}`\n立即前往下單購買！"
+            flow_res = await execute_autobuy_flow(target_url, name)
+            notify_title = flow_res["status_title"]
+            notify_body = flow_res["status_message"]
+            action_url = flow_res["action_url"]
+            btn_text = flow_res["action_button_text"]
+
         # 初次缺貨
         elif (not in_stock) and (last_notified_stock is None or last_notified_stock is True):
             should_send = True
             notify_title = "📢 **【商品目前缺貨提醒】**"
             notify_body = f"📦 **商品**：{name}\n🔴 **狀態**：{status_desc}\n系統正每 {poll_interval} 分鐘自動巡檢！"
+
         # 持續缺貨例行回報
         elif (not in_stock) and (last_notified_stock is False):
             if oos_hours > 0:
@@ -357,7 +369,7 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
 
     if should_send:
         NOTIFY_STATE[item_id] = {"last_notified_stock": in_stock, "last_notified_time": now_ts}
-        await broadcast_notification(client, notify_title, notify_body, target_url)
+        await broadcast_notification(client, notify_title, notify_body, action_url, btn_text)
 
 
 # =====================================================================
@@ -449,6 +461,13 @@ class UpdateConfigReq(BaseModel):
     enable_local_notification: bool
     telegram_bot_token: Optional[str] = ""
 
+class UpdateAutobuyReq(BaseModel):
+    enabled: bool
+    auto_checkout: bool
+    account_email: Optional[str] = ""
+    account_password: Optional[str] = ""
+    cookies_json: Optional[str] = ""
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(background_scheduler())
@@ -520,9 +539,46 @@ def api_update_config(req: UpdateConfigReq):
     save_config(APP_CONFIG)
     return {"success": True, "config": APP_CONFIG}
 
+@app.get("/api/autobuy")
+def api_get_autobuy():
+    cfg = load_autobuy_config()
+    cookies = load_saved_cookies()
+    return {
+        "config": cfg,
+        "has_cookies": bool(cookies),
+        "cookie_count": len(cookies),
+    }
+
+@app.post("/api/autobuy")
+def api_update_autobuy(req: UpdateAutobuyReq):
+    cfg = load_autobuy_config()
+    cfg["enabled"] = req.enabled
+    cfg["auto_checkout"] = req.auto_checkout
+    if req.account_email:
+        cfg["account_email"] = req.account_email.strip()
+    if req.account_password:
+        cfg["account_password"] = req.account_password.strip()
+    save_autobuy_config(cfg)
+
+    # 若有貼上 Cookie JSON 則保存
+    if req.cookies_json:
+        try:
+            parsed_cookies = json.loads(req.cookies_json)
+            if isinstance(parsed_cookies, list):
+                c_dict = {c["name"]: c["value"] for c in parsed_cookies if "name" in c and "value" in c}
+            elif isinstance(parsed_cookies, dict):
+                c_dict = parsed_cookies
+            else:
+                c_dict = {}
+            if c_dict:
+                save_cookies(c_dict)
+        except Exception as e:
+            return JSONResponse({"success": False, "message": f"Cookie 格式錯誤: {e}"}, status_code=400)
+
+    return {"success": True, "config": cfg}
+
 @app.get("/api/notifications/poll")
 def api_poll_notifications(since_id: Optional[str] = None):
-    """前端定期輪詢未讀取的本機通知"""
     if not since_id:
         return {"notifications": RECENT_LOCAL_NOTIFICATIONS[-5:]}
     idx = -1
@@ -556,6 +612,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .product-card:hover { transform: translateY(-2px); box-shadow: 0 4px 14px rgba(0,0,0,0.1); }
     .badge-in-stock { background-color: #198754; font-size: 0.9rem; }
     .badge-out-of-stock { background-color: #dc3545; font-size: 0.9rem; }
+    .autobuy-box { background-color: #fff9e6; border: 1px solid #ffeeba; border-radius: 8px; }
   </style>
 </head>
 <body class="p-3 p-md-4">
@@ -564,8 +621,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <!-- 頂部 Header -->
   <div class="p-4 mb-4 header-card shadow-sm d-flex flex-wrap justify-content-between align-items-center">
     <div>
-      <h3 class="mb-1 fw-bold"><i class="bi bi-box-seam me-2"></i>商品庫存監控與通知控制台</h3>
-      <p class="mb-0 text-white-50">支援好市多 Costco、PChome 等電商庫存即時偵測・本機桌面推播與 Telegram 雙向通報</p>
+      <h3 class="mb-1 fw-bold"><i class="bi bi-box-seam me-2"></i>商品庫存監控與自動搶購控制台</h3>
+      <p class="mb-0 text-white-50">支援好市多 Costco、PChome 等電商庫存即時偵測・自動加購物車・本機桌面推播與 Telegram 雙向通報</p>
     </div>
     <div class="mt-3 mt-md-0 d-flex gap-2">
       <button class="btn btn-outline-light btn-sm" onclick="requestNotificationPermission()">
@@ -605,13 +662,43 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- 右側：巡檢與通知偏好設定 -->
+    <!-- 右側：巡檢與通知、自動搶購偏好設定 -->
     <div class="col-lg-4">
+      <!-- 自動搶購設定卡片 -->
+      <div class="card shadow-sm border-0 rounded-3 mb-4 autobuy-box">
+        <div class="card-body p-4">
+          <h5 class="fw-bold text-dark mb-2"><i class="bi bi-lightning-charge-fill text-warning me-2"></i>自動加車與搶購模組</h5>
+          <p class="small text-muted mb-3">階梯式保護：每一段失敗至少保留前段正常執行並即時通知！</p>
+
+          <div class="form-check form-switch mb-2">
+            <input class="form-check-input" type="checkbox" id="cfgAutobuyEnabled">
+            <label class="form-check-label fw-bold" for="cfgAutobuyEnabled">⚡ 啟用第一階段：自動加入購物車</label>
+          </div>
+          <small class="text-muted d-block mb-3">補貨時自動把商品鎖在購物車，推播「已放入購物車！請在 15 分鐘內結帳」。</small>
+
+          <div class="form-check form-switch mb-2">
+            <input class="form-check-input" type="checkbox" id="cfgAutoCheckout">
+            <label class="form-check-label fw-bold" for="cfgAutoCheckout">🚀 啟用第二階段：自動直達結帳確認</label>
+          </div>
+          <small class="text-muted d-block mb-3">加車後自動推進至最後付款確認頁面，為您省下所有排隊步驟。</small>
+
+          <div class="mb-3">
+            <label class="form-label small fw-bold mb-1">電商登入 Session / Cookie (推薦貼上 Cookie JSON)</label>
+            <textarea id="cfgCookiesJson" rows="2" class="form-control form-control-sm" placeholder='可透過瀏覽器擴充套件導出 Cookie JSON 貼於此處'></textarea>
+            <div class="small text-success mt-1" id="cookieStatusText"></div>
+          </div>
+
+          <button class="btn btn-warning w-100 fw-bold py-2" onclick="saveAutobuyConfig()">
+            <i class="bi bi-save me-1"></i>儲存搶購模組設定
+          </button>
+        </div>
+      </div>
+
+      <!-- 巡檢與通知偏好設定 -->
       <div class="card shadow-sm border-0 rounded-3">
         <div class="card-body p-4">
           <h5 class="fw-bold mb-3"><i class="bi bi-sliders text-primary me-2"></i>巡檢與通知偏好設定</h5>
 
-          <!-- 1. 爬蟲週期 -->
           <div class="mb-3">
             <label class="form-label fw-bold">🔄 背景掃描頻率 (爬蟲週期)</label>
             <select id="cfgPollInterval" class="form-select">
@@ -622,7 +709,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </select>
           </div>
 
-          <!-- 2. 缺貨通報頻率 -->
           <div class="mb-3">
             <label class="form-label fw-bold">🔔 持續缺貨通知頻率</label>
             <select id="cfgOosHours" class="form-select">
@@ -638,7 +724,6 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 
           <hr class="my-3">
 
-          <!-- 3. 通知管道開關 -->
           <div class="form-check form-switch mb-2">
             <input class="form-check-input" type="checkbox" id="cfgLocalNotif" checked>
             <label class="form-check-label fw-bold" for="cfgLocalNotif">啟用本機/瀏覽器推播通知</label>
@@ -652,7 +737,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <small class="text-muted d-block mb-3">若您不想使用 Telegram，取消勾選此處即可完全只在本機運作。</small>
 
           <button class="btn btn-success w-100 fw-bold py-2 mt-2" onclick="saveConfig()">
-            <i class="bi bi-check-lg me-1"></i>儲存偏好設定
+            <i class="bi bi-check-lg me-1"></i>儲存一般偏好設定
           </button>
         </div>
       </div>
@@ -693,6 +778,49 @@ async function loadConfig() {
     document.getElementById("cfgTelegram").checked = cfg.enable_telegram !== false;
   } catch (e) {
     console.error("載入設定失敗", e);
+  }
+}
+
+async function loadAutobuyConfig() {
+  try {
+    const res = await fetch("/api/autobuy");
+    const data = await res.json();
+    const cfg = data.config || {};
+    document.getElementById("cfgAutobuyEnabled").checked = !!cfg.enabled;
+    document.getElementById("cfgAutoCheckout").checked = !!cfg.auto_checkout;
+    const cookieText = document.getElementById("cookieStatusText");
+    if (data.has_cookies) {
+      cookieText.innerText = "✅ 本地已載入 " + data.cookie_count + " 個 Cookie 憑證！";
+    } else {
+      cookieText.innerText = "ℹ️ 尚未匯入 Cookie，若補貨將降級為手動一鍵搶購。";
+    }
+  } catch (e) {
+    console.error("載入搶購設定失敗", e);
+  }
+}
+
+async function saveAutobuyConfig() {
+  const payload = {
+    enabled: document.getElementById("cfgAutobuyEnabled").checked,
+    auto_checkout: document.getElementById("cfgAutoCheckout").checked,
+    cookies_json: document.getElementById("cfgCookiesJson").value.trim()
+  };
+  try {
+    const res = await fetch("/api/autobuy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (res.ok) {
+      alert("✅ 自動搶購與加車模組設定已更新！");
+      document.getElementById("cfgCookiesJson").value = "";
+      loadAutobuyConfig();
+    } else {
+      const err = await res.json();
+      alert("❌ 儲存失敗: " + (err.message || "未知錯誤"));
+    }
+  } catch (e) {
+    alert("❌ 儲存失敗: " + e);
   }
 }
 
@@ -835,7 +963,6 @@ async function refreshSingle(id) {
   }
 }
 
-// 本機輪詢推播通知
 async function pollLocalNotifications() {
   try {
     const url = "/api/notifications/poll" + (lastNotificationId ? "?since_id=" + lastNotificationId : "");
@@ -862,12 +989,12 @@ async function pollLocalNotifications() {
   setTimeout(pollLocalNotifications, 3000);
 }
 
-// 頁面初次初始化
 window.addEventListener("DOMContentLoaded", () => {
   if ("Notification" in window) {
     updateNotifButton(Notification.permission);
   }
   loadConfig();
+  loadAutobuyConfig();
   fetchAll();
   pollLocalNotifications();
 });
@@ -884,7 +1011,7 @@ def index_page():
 if __name__ == "__main__":
     import uvicorn
     print("=" * 65)
-    print("🚀 啟動【本地 Web 控制台 + 桌面推播 + 庫存巡檢系統】")
+    print("🚀 啟動【本地 Web 控制台 + 階梯式自動加車/結帳 + 桌面推播系統】")
     print("🌐 控制台網址: http://localhost:8000")
     print("📁 資料檔案: " + str(DATA_FILE))
     print("=" * 65)
