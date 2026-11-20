@@ -595,7 +595,9 @@ class AddCustomRuleReq(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(background_scheduler())
-    asyncio.create_task(telegram_bot_worker())
+    # 避免與專屬 telegram_bot_service 搶奪 update 衝突
+    if os.getenv("ENABLE_LOCAL_TG_WORKER", "false").lower() == "true":
+        asyncio.create_task(telegram_bot_worker())
     asyncio.create_task(scheduled_tasks_worker())
 
 @app.get("/api/items")
