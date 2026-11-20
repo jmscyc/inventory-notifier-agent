@@ -155,7 +155,7 @@ def save_tracked_items(items: list):
     except Exception as e:
         print(f"⚠️ 儲存商品清單失敗: {e}")
 
-def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes: str, item_id: str = "") -> dict:
+def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes: str, item_id: str = "", preferred_option: str = "") -> dict:
     items = load_tracked_items()
     now_str = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -175,6 +175,8 @@ def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes:
             it["in_stock"] = in_stock
             it["status_notes"] = status_notes
             it["last_checked"] = now_str
+            if preferred_option:
+                it["preferred_option"] = preferred_option
             updated = True
             break
 
@@ -186,6 +188,7 @@ def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes:
             "in_stock": in_stock,
             "status_notes": status_notes,
             "last_checked": now_str,
+            "preferred_option": preferred_option or "",
         })
 
     save_tracked_items(items)
@@ -201,15 +204,13 @@ def delete_item(item_id: str) -> bool:
 
 
 # =====================================================================
-# 2. 爬蟲檢測模組 (支援通用電商與自訂規則)
+# 2. 爬蟲檢測模組 (支援通用電商、自訂規則與動態 UA 偽裝)
 # =====================================================================
 
 def check_product_inventory(url: str) -> dict:
+    from app.autobuy_module import get_random_ua
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": get_random_ua(),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     }
@@ -403,7 +404,8 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
             # 有貨：若先前是缺貨、未曾通知，或者距離上次有貨通知超過 15 分鐘，持續提醒有現貨！
             if (last_notified_stock is not True) or (now_ts - last_notified_time >= 900):
                 should_send = True
-                flow_res = await execute_autobuy_flow(target_url, name)
+                p_opt = item.get("preferred_option", "")
+                flow_res = await execute_autobuy_flow(target_url, name, preferred_option=p_opt)
                 notify_title = flow_res["status_title"]
                 notify_body = flow_res["status_message"]
                 action_url = flow_res["action_url"]
@@ -525,8 +527,10 @@ async def background_scheduler():
                 SCHEDULER_STATUS["last_check_result"] = f"巡檢發生異常: {str(e)}"
                 print(f"排程迴圈例外: {e}")
 
-            # 倒數計時器
-            total_seconds = max(interval_min * 60, 10)
+            # 倒數計時器 (加入 ±10% 隨機防爬 Jitter)
+            from app.autobuy_module import get_jitter_seconds
+            base_s = max(interval_min * 60, 10)
+            total_seconds = int(get_jitter_seconds(base_s, jitter_pct=0.1))
             for remaining in range(total_seconds, 0, -1):
                 if not APP_CONFIG.get("is_scheduler_running", True):
                     break
@@ -587,6 +591,7 @@ app = FastAPI(title="商品庫存監控與智慧自動化控制台")
 
 class AddItemReq(BaseModel):
     url: str
+    preferred_option: Optional[str] = ""
 
 class UpdateConfigReq(BaseModel):
     poll_interval_minutes: int
@@ -612,6 +617,7 @@ class UpdateAutobuyReq(BaseModel):
 class AutobuyTestReq(BaseModel):
     target_url: str
     product_name: Optional[str] = "測試商品"
+    preferred_option: Optional[str] = ""
 
 class AddScheduledTaskReq(BaseModel):
     title: str
@@ -646,13 +652,14 @@ def api_get_items():
 @app.post("/api/items")
 async def api_add_item(req: AddItemReq):
     url = req.url.strip()
+    preferred_option = req.preferred_option.strip() if req.preferred_option else ""
     if not url.startswith("http"):
         return JSONResponse({"success": False, "message": "請輸入有效的 HTTP/HTTPS 商品網址！"}, status_code=400)
     crawl_res = await asyncio.to_thread(check_product_inventory, url)
     title = crawl_res.get("title", url)
     in_stock = crawl_res.get("in_stock", False)
     status_desc = crawl_res.get("status_description", "")
-    item = add_or_update_item(name=title, target_url=url, in_stock=in_stock, status_notes=status_desc)
+    item = add_or_update_item(name=title, target_url=url, in_stock=in_stock, status_notes=status_desc, preferred_option=preferred_option)
     # 重設通知狀態為 None，讓新增後首次檢查或即刻觸發有貨/缺貨通知
     NOTIFY_STATE[item["id"]] = {"last_notified_stock": None, "last_notified_time": 0}
     # 若有現貨，新增當下立即發出第一次推播通知！
@@ -821,9 +828,10 @@ def api_update_autobuy(req: UpdateAutobuyReq):
 @app.post("/api/autobuy/test")
 async def api_test_autobuy(req: AutobuyTestReq):
     url = req.target_url.strip()
+    preferred_opt = req.preferred_option.strip() if req.preferred_option else ""
     if not url.startswith("http"):
         return JSONResponse({"success": False, "message": "請輸入有效商品網址！"}, status_code=400)
-    res = await execute_autobuy_flow(url, req.product_name or "測試商品", is_test_run=True)
+    res = await execute_autobuy_flow(url, req.product_name or "測試商品", is_test_run=True, preferred_option=preferred_opt)
     return {"success": True, "result": res}
 
 # AI 除錯診斷報告導出 API
@@ -831,6 +839,69 @@ async def api_test_autobuy(req: AutobuyTestReq):
 def api_get_debug_report():
     report_markdown = get_last_diagnostic_export()
     return {"success": True, "report_markdown": report_markdown}
+
+# Cookie 憑證健康度檢查 API
+@app.get("/api/cookie/health")
+async def api_get_cookie_health():
+    from app.autobuy_module import check_cookie_health
+    res = await check_cookie_health()
+    return {"success": True, "health": res}
+
+# 系統一鍵備份匯出 API (Backup Export)
+@app.get("/api/backup/export")
+def api_backup_export():
+    settings = APP_CONFIG
+    products = load_tracked_items()
+    scheduled_tasks = load_scheduled_tasks()
+    from app.custom_crawler_module import load_custom_rules
+    custom_rules = load_custom_rules()
+    
+    backup_data = {
+        "export_time": datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "version": "2.0-flagship",
+        "settings": settings,
+        "products": products,
+        "scheduled_tasks": scheduled_tasks,
+        "custom_rules": custom_rules
+    }
+    return JSONResponse(
+        content=backup_data,
+        headers={"Content-Disposition": "attachment; filename=monitor_system_backup.json"}
+    )
+
+# 系統一鍵備份匯入還原 API (Backup Import)
+class RestoreBackupReq(BaseModel):
+    backup_json: str
+
+@app.post("/api/backup/restore")
+def api_backup_restore(req: RestoreBackupReq):
+    try:
+        data = json.loads(req.backup_json)
+        if not isinstance(data, dict):
+            return JSONResponse({"success": False, "message": "備份檔案內容必須是 JSON 物件"}, status_code=400)
+        
+        # 還原 settings
+        if "settings" in data and isinstance(data["settings"], dict):
+            for k, v in data["settings"].items():
+                APP_CONFIG[k] = v
+            save_config(APP_CONFIG)
+            
+        # 還原 products
+        if "products" in data and isinstance(data["products"], list):
+            save_tracked_items(data["products"])
+            
+        # 還原 scheduled_tasks
+        if "scheduled_tasks" in data and isinstance(data["scheduled_tasks"], list):
+            save_scheduled_tasks(data["scheduled_tasks"])
+            
+        # 還原 custom_rules
+        if "custom_rules" in data and isinstance(data["custom_rules"], list):
+            from app.custom_crawler_module import save_custom_rules
+            save_custom_rules(data["custom_rules"])
+            
+        return {"success": True, "message": "🎉 系統所有設定、商品與規則已成功還原！"}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": f"還原失敗: {str(e)}"}, status_code=400)
 
 # 預約任務 API
 @app.get("/api/scheduled_tasks")
@@ -921,6 +992,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <button class="btn btn-outline-light btn-sm" onclick="requestNotificationPermission()">
         <i class="bi bi-bell-fill me-1"></i><span id="notifBtnText">啟用本機推播通知</span>
       </button>
+      <button class="btn btn-outline-light btn-sm text-white" onclick="exportBackup()">
+        <i class="bi bi-cloud-arrow-down me-1"></i>匯出備份
+      </button>
+      <button class="btn btn-outline-light btn-sm text-white" onclick="document.getElementById('importBackupFile').click()">
+        <i class="bi bi-cloud-arrow-up me-1"></i>還原備份
+      </button>
+      <input type="file" id="importBackupFile" style="display:none" accept=".json" onchange="handleRestoreBackup(event)">
       <button class="btn btn-light btn-sm text-primary fw-bold" onclick="fetchAll(true)">
         <i class="bi bi-arrow-clockwise me-1"></i>全部重新爬蟲
       </button>
@@ -955,7 +1033,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             <div class="col-6">
               <div class="text-muted small"><i class="bi bi-hourglass-split text-primary me-1"></i>下一次檢查倒數</div>
               <h5 class="fw-bold text-primary mb-0 mt-1" id="nextCheckCountdown">--:--</h5>
-              <div class="text-muted" style="font-size: 0.75rem;" id="pollCycleHint">週期: 5 分鐘</div>
+              <div class="text-muted" style="font-size: 0.75rem;" id="pollCycleHint">週期: 5 分鐘 (±10% Jitter)</div>
             </div>
             <div class="col-6">
               <div class="text-muted small"><i class="bi bi-bell text-warning me-1"></i>下一次主動通知</div>
@@ -965,9 +1043,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- 最近一次檢查時間與結果 -->
+        <!-- 最近一次檢查時間與 Cookie 健康指標 -->
         <div class="col-md-4">
-          <div class="text-muted small"><i class="bi bi-clock-history me-1"></i>最近檢查時間：<span class="fw-bold text-dark" id="lastCheckTimeText">尚未執行</span></div>
+          <div class="d-flex justify-content-between align-items-center">
+            <div class="text-muted small"><i class="bi bi-clock-history me-1"></i>最近檢查：<span class="fw-bold text-dark" id="lastCheckTimeText">尚未執行</span></div>
+            <div id="cookieHealthBadge" class="badge bg-secondary cursor-pointer" onclick="checkCookieHealthUI()" title="點擊檢驗憑證健康度">
+              🍪 檢查 Cookie
+            </div>
+          </div>
           <div class="mt-1 text-truncate" style="font-size: 0.85rem;">
             <span class="badge bg-light text-dark border me-1">結果</span>
             <span id="lastCheckResultText" class="text-muted">系統就緒中...</span>
@@ -1009,13 +1092,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <div class="card shadow-sm border-0 mb-4 rounded-3">
             <div class="card-body p-4">
               <h5 class="fw-bold mb-3"><i class="bi bi-plus-circle text-primary me-2"></i>新增追蹤商品</h5>
-              <div class="input-group">
-                <input type="url" id="newUrlInput" class="form-control form-control-lg" placeholder="請貼上商品完整網址 (例: https://www.costco.com.tw/.../p/123456)">
+              <div class="row g-2">
+                <div class="col-md-8">
+                  <input type="url" id="newUrlInput" class="form-control form-control-lg" placeholder="請貼上商品完整網址 (例: https://www.costco.com.tw/.../p/123456)">
+                </div>
+                <div class="col-md-4">
+                  <input type="text" id="newPreferredOptionInput" class="form-control form-control-lg" placeholder="指定尺寸/規格 (選填, 例: L號/黑)">
+                </div>
+              </div>
+              <div class="d-flex justify-content-between align-items-center mt-3">
+                <div class="form-text text-muted">支援指定顏色、尺寸自動點選。加入前即刻至頁面檢驗是否具備現貨與數量選單。</div>
                 <button class="btn btn-primary px-4 fw-bold" id="addBtn" onclick="addProduct()">
                   <span id="addBtnSpinner" class="spinner-border spinner-border-sm d-none me-1"></span>新增追蹤
                 </button>
               </div>
-              <div class="form-text text-muted mt-2">支援好市多、PChome 等電商，加入前即刻至頁面檢驗是否具備現貨與數量選單。</div>
             </div>
           </div>
 
@@ -1666,11 +1756,13 @@ function renderProducts(items) {
       ? '<span class="badge badge-in-stock px-3 py-2"><i class="bi bi-check-circle-fill me-1"></i>有現貨</span>'
       : '<span class="badge badge-out-of-stock px-3 py-2"><i class="bi bi-x-circle-fill me-1"></i>缺貨中</span>';
 
+    const optBadge = it.preferred_option ? `<span class="badge bg-info text-dark ms-2"><i class="bi bi-tag-fill me-1"></i>規格: ${it.preferred_option}</span>` : '';
+
     html += `
       <div class="card product-card p-3">
         <div class="card-body p-2">
           <div class="d-flex justify-content-between align-items-start mb-2">
-            <h6 class="fw-bold mb-1 text-truncate" style="max-width: 75%;">${it.name || "未命名商品"}</h6>
+            <h6 class="fw-bold mb-1 text-truncate" style="max-width: 75%;">${it.name || "未命名商品"} ${optBadge}</h6>
             ${badge}
           </div>
           <div class="small text-muted mb-2"><i class="bi bi-info-circle me-1"></i>狀態詳情：${it.status_notes || "無"}</div>
@@ -1697,7 +1789,9 @@ function renderProducts(items) {
 
 async function addProduct() {
   const input = document.getElementById("newUrlInput");
+  const optInput = document.getElementById("newPreferredOptionInput");
   const url = input.value.trim();
+  const preferred_option = optInput ? optInput.value.trim() : "";
   if (!url) {
     alert("請貼上商品網址！");
     return;
@@ -1711,11 +1805,12 @@ async function addProduct() {
     const res = await fetch("/api/items", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url })
+      body: JSON.stringify({ url, preferred_option })
     });
     const data = await res.json();
     if (res.ok) {
       input.value = "";
+      if (optInput) optInput.value = "";
       fetchAll();
     } else {
       alert("❌ " + (data.message || "新增失敗"));
@@ -1725,6 +1820,64 @@ async function addProduct() {
   } finally {
     btn.disabled = false;
     spinner.classList.add("d-none");
+  }
+}
+
+// 匯出完整設定與規則備份 (Backup Export)
+function exportBackup() {
+  window.open("/api/backup/export", "_blank");
+}
+
+// 還原備份檔 (Backup Restore)
+async function handleRestoreBackup(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    try {
+      const content = e.target.result;
+      const res = await fetch("/api/backup/restore", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backup_json: content })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        alert("🎉 " + data.message);
+        fetchAll();
+        loadConfig();
+        loadAutobuyConfig();
+      } else {
+        alert("❌ 還原失敗：" + data.message);
+      }
+    } catch (err) {
+      alert("❌ 解析備份檔案異常：" + err);
+    }
+  };
+  reader.readAsText(file);
+  event.target.value = "";
+}
+
+// 檢驗 Cookie 健康狀態
+async function checkCookieHealthUI() {
+  const badge = document.getElementById("cookieHealthBadge");
+  badge.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>檢測中...';
+  try {
+    const res = await fetch("/api/cookie/health");
+    const data = await res.json();
+    const h = data.health || {};
+    if (h.is_valid) {
+      badge.className = "badge bg-success cursor-pointer";
+      badge.innerText = `🍪 Cookie 有效 (${h.cookie_count}筆)`;
+      alert(`✅ 電商登入憑證有效中！\n狀態：${h.message}\n有效 Cookie 數量：${h.cookie_count} 筆`);
+    } else {
+      badge.className = "badge bg-danger cursor-pointer";
+      badge.innerText = `🍪 Cookie 失效`;
+      alert(`⚠️ 憑證警報：\n${h.message}`);
+    }
+  } catch (err) {
+    badge.className = "badge bg-warning text-dark cursor-pointer";
+    badge.innerText = `🍪 連線異常`;
   }
 }
 

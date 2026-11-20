@@ -33,6 +33,28 @@ try:
 except Exception:
     TAIPEI_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
+# =====================================================================
+# 🥷 動態反爬 User-Agent 輪替庫與隨機延遲 (Stealth Browsing)
+# =====================================================================
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.3; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"
+]
+
+def get_random_ua() -> str:
+    import random
+    return random.choice(USER_AGENTS)
+
+def get_jitter_seconds(base_seconds: float, jitter_pct: float = 0.1) -> float:
+    """計算隨機時間擾動 (預設 ±10%)，消除機器人固定間隔特徵"""
+    import random
+    delta = base_seconds * jitter_pct
+    return round(random.uniform(base_seconds - delta, base_seconds + delta), 2)
+
 DEFAULT_AUTOBUY_CONFIG = {
     "enabled": False,                       # 是否開啟自動搶購/加車
     "auto_checkout": False,                 # 是否推進至結帳確認頁面
@@ -56,6 +78,53 @@ DEFAULT_AUTOBUY_CONFIG = {
     "cart_url": "https://www.costco.com.tw/cart",
     "checkout_url": "https://www.costco.com.tw/checkout",
 }
+
+# =====================================================================
+# 🛡️ Cookie 憑證健康度主動探針 (Session Health Probe)
+# =====================================================================
+async def check_cookie_health() -> Dict[str, Any]:
+    """檢驗目前儲存的 Cookie 是否依然保持有效登入狀態"""
+    cookies = load_saved_cookies()
+    if not cookies:
+        return {
+            "is_valid": False,
+            "status": "NO_COOKIES",
+            "message": "尚未設定任何 Cookie 憑證",
+            "cookie_count": 0
+        }
+    
+    url = "https://www.costco.com.tw/my-account"
+    headers = {
+        "User-Agent": get_random_ua(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        async with httpx.AsyncClient(headers=headers, cookies=cookies, timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(url)
+            # 若被 302 重導向回登入頁或含有 login 關鍵字，代表 session 已失效
+            final_url = str(resp.url).lower()
+            if "login" in final_url or resp.status_code == 440:
+                return {
+                    "is_valid": False,
+                    "status": "EXPIRED",
+                    "message": "⚠️ 電商登入憑證已過期失效！若有補貨將無法自動加車，請儘速重新匯入 Cookie。",
+                    "cookie_count": len(cookies),
+                    "status_code": resp.status_code
+                }
+            return {
+                "is_valid": True,
+                "status": "ACTIVE",
+                "message": "✅ 電商登入憑證目前有效中！",
+                "cookie_count": len(cookies),
+                "status_code": resp.status_code
+            }
+    except Exception as e:
+        return {
+            "is_valid": True,  # 遇網路抖動不誤報失效
+            "status": "UNKNOWN",
+            "message": f"驗證連線異常: {e}",
+            "cookie_count": len(cookies)
+        }
 
 # 暫存最近一次測試或執行的 AI 除錯診斷報告
 LAST_DIAGNOSTIC_REPORT: Dict[str, Any] = {
@@ -149,15 +218,16 @@ def record_diagnostic_log(logs: list, step_name: str, status: str, detail: str =
     logs.append(entry)
     print(f"[{entry['time']}] [{step_name}] {status}: {detail}")
 
-async def execute_autobuy_flow(target_url: str, product_name: str = "商品", is_test_run: bool = False) -> Dict[str, Any]:
-    """執行自動搶購流水線 (支援真實觸發與沙盒測試)"""
+async def execute_autobuy_flow(target_url: str, product_name: str = "商品", is_test_run: bool = False, preferred_option: str = "") -> Dict[str, Any]:
+    """執行自動搶購流水線 (支援真實觸發、沙盒測試與規格/尺寸自動選擇)"""
     global LAST_DIAGNOSTIC_REPORT
     cfg = load_autobuy_config()
     cookies = load_saved_cookies()
     logs = []
     
     now_taipei = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    record_diagnostic_log(logs, "INIT", "INFO", f"啟動搶購流程: {product_name} ({target_url}) | 模式: {'沙盒測試' if is_test_run else '正式執行'}")
+    opt_info = f" | 指定規格: {preferred_option}" if preferred_option else ""
+    record_diagnostic_log(logs, "INIT", "INFO", f"啟動搶購流程: {product_name} ({target_url}) | 模式: {'沙盒測試' if is_test_run else '正式執行'}{opt_info}")
 
     if not is_test_run and not cfg.get("enabled", False):
         record_diagnostic_log(logs, "CHECK_ENABLED", "SKIPPED", "未啟用自動加車功能，保持純通知")
@@ -241,6 +311,17 @@ async def execute_autobuy_flow(target_url: str, product_name: str = "商品", is
                         save_cookies({c["name"]: c["value"] for c in new_c})
                         record_diagnostic_log(logs, "LOGIN_FLOW", "SUCCESS", "帳密登入完成，更新最新 Cookie")
                         await page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
+
+                # 規格 / 尺寸 / 顏色自動選擇 (SKU Auto-Selector)
+                if preferred_option:
+                    record_diagnostic_log(logs, "SKU_SELECT", "START", f"嘗試自動選擇指定規格/尺寸: {preferred_option}")
+                    option_el = await page.query_selector(f"button:has-text('{preferred_option}'), a:has-text('{preferred_option}'), label:has-text('{preferred_option}'), option:has-text('{preferred_option}')")
+                    if option_el:
+                        await option_el.click()
+                        await page.wait_for_timeout(1200)
+                        record_diagnostic_log(logs, "SKU_SELECT", "SUCCESS", f"已成功點選規格「{preferred_option}」！")
+                    else:
+                        record_diagnostic_log(logs, "SKU_SELECT", "SKIPPED", f"未找到符合「{preferred_option}」之選項標籤，繼續使用預設規格")
 
                 # 尋找「加入購物車」按鈕
                 add_btn = await page.query_selector("#add-to-cart-button, button.add-to-cart, button:has-text('加入購物車')")

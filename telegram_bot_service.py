@@ -138,6 +138,30 @@ async def handle_callback(client: httpx.AsyncClient, cb: dict):
         q_state = "🟢 已開啟夜間防打擾" if settings["quiet_hours_enabled"] else "☀️ 已關閉夜間防打擾 (24H通知)"
         await send_msg(client, from_chat_id, f"🌙 **夜間靜音設定已切換**：{q_state}")
 
+    # ⚡ Telegram 遠端代搶點擊回呼 (Remote Trigger)
+    elif cb_data.startswith("buy_"):
+        target_id = cb_data.replace("buy_", "").strip()
+        matched = [p for p in products if str(p.get("id")) == target_id]
+        if matched:
+            target_prod = matched[0]
+            p_url = target_prod.get("url")
+            p_name = target_prod.get("name", "商品")
+            p_option = target_prod.get("preferred_option", "")
+
+            await send_msg(client, from_chat_id, f"⚡ **【收到遠端搶購指令】**\n正在調用本機自動加車引擎處理 `{p_name}`...")
+            try:
+                from app.autobuy_module import execute_autobuy_flow
+                res = await execute_autobuy_flow(p_url, p_name, is_test_run=False, preferred_option=p_option)
+                st_title = res.get("status_title", "搶購完成")
+                st_msg = res.get("status_message", "")
+                act_url = res.get("action_url", p_url)
+                kb = [[{"text": res.get("action_button_text", "🛒 前往查看"), "url": act_url}]]
+                await send_msg(client, from_chat_id, f"{st_title}\n\n{st_msg}", kb)
+            except Exception as e:
+                await send_msg(client, from_chat_id, f"❌ 遠端搶購執行例外: {e}")
+        else:
+            await send_msg(client, from_chat_id, "⚠️ 找不到該商品或已被移除。")
+
 async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str):
     settings, products = load_data()
 
@@ -161,14 +185,15 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
 
     # 2. 🔍 立即檢查庫存
     elif text == "🔍 立即檢查庫存" or text in ["/check", "檢查"]:
-        await send_msg(client, chat_id, "🔍 **正在即時連線好市多官方伺服器抓取庫存中...** (約需 1~2 秒)")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        await send_msg(client, chat_id, "🔍 **正在即時連線官方伺服器抓取庫存中...** (約需 1~2 秒)")
+        from app.autobuy_module import get_random_ua
+        headers = {"User-Agent": get_random_ua()}
         res_text = "🏁 **【立即檢查最新結果】**\n\n"
+        any_in_stock_btns = []
         for p in products:
             p_url = p.get("url")
             p_name = p.get("name", p_url)
+            p_id = str(p.get("id"))
             try:
                 r = await client.get(p_url, headers=headers, timeout=10.0)
                 soup = BeautifulSoup(r.text, "html.parser")
@@ -178,11 +203,18 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
                 st = "🟢 有現貨！" if in_stock else "🔴 缺貨中"
                 p["last_status"] = st
                 res_text += f"• **{p_name}**：`{st}`\n"
+                if in_stock:
+                    any_in_stock_btns.append([
+                        {"text": f"⚡ 遠端代搶: {p_name[:12]}", "callback_data": f"buy_{p_id}"},
+                        {"text": "🛒 手動頁面", "url": p_url}
+                    ])
             except Exception:
                 res_text += f"• **{p_name}**：`抓取失敗`\n"
 
         save_data(settings, products)
-        await send_msg(client, chat_id, res_text)
+        if any_in_stock_btns:
+            res_text += "\n👇 **發現現貨！點擊下方按鈕可直接啟動本機代搶加車**："
+        await send_msg(client, chat_id, res_text, any_in_stock_btns if any_in_stock_btns else None)
 
     # 3. ⏱️ 設定檢查與通知頻率
     elif text == "⏱️ 設定檢查與通知頻率" or text in ["/frequency", "頻率"]:
@@ -217,9 +249,19 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
         p_min = settings.get("poll_interval_minutes", 15)
         oos_min = settings.get("oos_periodic_notify_minutes", 240)
 
+        # 檢驗 Cookie 憑證健康度
+        try:
+            from app.autobuy_module import check_cookie_health
+            c_health = await check_cookie_health()
+            c_icon = "🟢 有效" if c_health.get("is_valid") else "🔴 過期或未設定"
+            c_desc = f"{c_icon} ({c_health.get('cookie_count', 0)} 筆)"
+        except Exception:
+            c_desc = "⚪ 未知"
+
         status_reply = (
             f"⚙️ **【系統開關與狀態儀表板】**\n\n"
             f"⚡ **總監控狀態**：{is_act}\n"
+            f"🍪 **Cookie 憑證狀態**：`{c_desc}`\n"
             f"⏰ **檢查頻率**：每 `{p_min} 分鐘` 一次\n"
             f"📢 **缺貨提醒頻率**：每 `{oos_min} 分鐘` 一次\n"
             f"🌙 **夜間靜音時段**：{q_on} (`{q_range}`)\n"
