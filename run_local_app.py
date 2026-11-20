@@ -55,7 +55,12 @@ load_dotenv()
 
 DATA_FILE = Path(__file__).parent / "tracked_products.json"
 CONFIG_FILE = Path(__file__).parent / "app_config.json"
-TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+try:
+    import zoneinfo
+    TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+except Exception:
+    # 支援 Windows 預設未安裝 tzdata 之環境
+    TAIPEI_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 # =====================================================================
 # 1. 組態設定與本地資料持久化

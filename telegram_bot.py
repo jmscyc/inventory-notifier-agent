@@ -42,7 +42,12 @@ runner = Runner(agent=root_agent, session_service=session_service, app_name="inv
 user_sessions = {}
 
 API_BASE = f"https://api.telegram.org/bot{TOKEN}"
-TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+try:
+    import zoneinfo
+    TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+except Exception:
+    # 支援 Windows 預設未安裝 tzdata 之環境
+    TAIPEI_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 # 1. 背景巡檢掃描頻率（分鐘，預設 5 分鐘，支援 1, 3, 5, 10 分鐘切換）
 POLL_INTERVAL_MINUTES = 5

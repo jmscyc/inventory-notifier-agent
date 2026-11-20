@@ -17,7 +17,7 @@ if %errorlevel% neq 0 (
 )
 
 echo [1/3] 正在檢查並更新依賴套件...
-python -m pip install -q fastapi uvicorn httpx beautifulsoup4 python-dotenv
+python -m pip install -q fastapi uvicorn httpx beautifulsoup4 python-dotenv tzdata
 
 echo [2/3] 正在啟動後台服務與自動打開瀏覽器...
 start "" "http://localhost:8000"

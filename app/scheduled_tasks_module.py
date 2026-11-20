@@ -20,7 +20,12 @@ import httpx
 
 DATA_DIR = Path(__file__).parent.parent
 TASKS_FILE = DATA_DIR / "scheduled_tasks.json"
-TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+try:
+    import zoneinfo
+    TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+except Exception:
+    # 支援 Windows 預設未安裝 tzdata 之環境
+    TAIPEI_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 def load_scheduled_tasks() -> List[dict]:
     if not TASKS_FILE.exists():

@@ -40,7 +40,12 @@ if not TOKEN:
     sys.exit(1)
 
 API_BASE = f"https://api.telegram.org/bot{TOKEN}"
-TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+try:
+    import zoneinfo
+    TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+except Exception:
+    # 支援 Windows 預設未安裝 tzdata 之環境
+    TAIPEI_TZ = datetime.timezone(datetime.timedelta(hours=8))
 DATA_FILE = Path(__file__).parent / "tracked_products.json"
 
 # 全域排程與通知頻率

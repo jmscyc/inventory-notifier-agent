@@ -22,7 +22,12 @@ from bs4 import BeautifulSoup
 
 DATA_DIR = Path(__file__).parent.parent
 RULES_FILE = DATA_DIR / "custom_crawler_rules.json"
-TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+try:
+    import zoneinfo
+    TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
+except Exception:
+    # 支援 Windows 預設未安裝 tzdata 之環境
+    TAIPEI_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 def load_custom_rules() -> List[dict]:
     if not RULES_FILE.exists():
