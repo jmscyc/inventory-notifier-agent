@@ -1,9 +1,43 @@
-# simple-agent
+# 商品庫存監控與智慧提醒系統 (Inventory Notifier Agent)
 
-Simple ReAct agent
-Agent generated with `agents-cli` version `1.4.0`
+支援電商（Costco 好市多、PChome 等）商品庫存即時偵測、背景自動巡檢、桌面推播與 Telegram 雙向通報之智慧助理。
+
+---
+
+## 🚀 本地快速啟動（Web 控制台與本機桌面通知）
+
+無需設定複雜的雲端環境，直接在本地電腦執行即可開啟完整的圖形控制台與桌面通知：
+
+### 1. 安裝必要套件（若尚未安裝）
+```bash
+pip install fastapi uvicorn httpx beautifulsoup4 python-dotenv
+```
+
+### 2. 啟動 Web 控制台
+```bash
+python3 run_local_app.py
+```
+
+啟動後，請在瀏覽器開啟：
+👉 **http://localhost:8000**
+
+* 🖥️ **視覺化介面**：支援貼上網址自動解析加入追蹤、查看即時庫存清單、單鍵手動重新爬蟲與移除商品。
+* 🔔 **本機桌面通知**：點擊頁面上的「啟用瀏覽器本機通知」，補貨或缺貨時直接在電腦右下角彈出推播與音效。
+* ⚙️ **偏好設定**：自由調整背景掃描週期（1~10分鐘）、缺貨通報頻率，並可隨時開啟或關閉 Telegram / 本機通知。
+
+---
+
+## 🤖 啟動純 Telegram Bot（可選）
+
+若只想以純 Telegram 聊天介面進行操作：
+```bash
+python3 run_local_bot.py
+```
+
+---
 
 ## Project Structure
+
 
 ```
 simple-agent/
