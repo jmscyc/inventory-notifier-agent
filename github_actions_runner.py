@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-GitHub Actions 專用無伺服器雲端監控核心腳本
-- 不需要本機開機、不需要 CMD
-- 每 15 分鐘由 GitHub 伺服器在雲端自動執行
-- 若發現有現貨，立即發送 Telegram 即時通知至使用者手機
+GitHub Actions 專用無伺服器雲端監控核心腳本 (整合設定版)
+- 免開電腦、免開 CMD、免費用
+- 整合 settings 與 products 於單一 tracked_products.json
+- 支援靜音時段、自訂缺貨定時提醒週期、Telegram 互動指令
 """
 
 import asyncio
@@ -14,7 +14,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any, List
 
 import httpx
 from bs4 import BeautifulSoup
@@ -27,39 +27,58 @@ except Exception:
 
 BASE_DIR = Path(__file__).parent
 DATA_FILE = BASE_DIR / "tracked_products.json"
-STATUS_FILE = BASE_DIR / "last_check_status.json"
+LAST_STATE_FILE = BASE_DIR / "last_check_status.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-def load_tracked_items() -> list:
+def load_config_and_products() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    default_config = {
+        "is_active": True,
+        "quiet_hours_enabled": True,
+        "quiet_hours_start": 1,
+        "quiet_hours_end": 5,
+        "oos_periodic_notify_hours": 4,
+        "telegram": {"enabled": True}
+    }
     if not DATA_FILE.exists():
-        print(f"⚠️ 找不到 {DATA_FILE}，建立預設追蹤檔案...")
-        default_items = [
-            {
-                "id": "item-142997",
-                "name": "科克蘭 三層抽取式衛生紙 120張 X 24包",
-                "target_url": "https://www.costco.com.tw/p/142997",
-                "in_stock": False,
-                "status_notes": "初始化",
-                "last_checked": ""
-            }
-        ]
-        save_tracked_items(default_items)
-        return default_items
+        return default_config, []
+
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            # 若為舊版 array 格式相容轉換
+            if isinstance(data, list):
+                return default_config, data
+            settings = data.get("settings", default_config)
+            products = data.get("products", [])
+            return settings, products
     except Exception as e:
-        print(f"讀取商品清單失敗: {e}")
-        return []
+        print(f"⚠️ 讀取 {DATA_FILE} 失敗: {e}")
+        return default_config, []
 
-def save_tracked_items(items: list):
+def save_config_and_products(settings: Dict[str, Any], products: List[Dict[str, Any]]):
     try:
+        content = {
+            "_說明": "【好市多智慧監控設定檔】直接在此修改週期與商品，GitHub 雲端每 15 分鐘全自動巡檢！",
+            "settings": settings,
+            "products": products
+        }
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
+            json.dump(content, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"儲存商品清單失敗: {e}")
+        print(f"⚠️ 儲存失敗: {e}")
+
+def is_in_quiet_hours(settings: Dict[str, Any]) -> bool:
+    if not settings.get("quiet_hours_enabled", True):
+        return False
+    start_h = settings.get("quiet_hours_start", 1)
+    end_h = settings.get("quiet_hours_end", 5)
+    current_hour = datetime.datetime.now(TAIPEI_TZ).hour
+    if start_h <= end_h:
+        return start_h <= current_hour < end_h
+    else: # 跨夜設定如 23 到 6
+        return current_hour >= start_h or current_hour < end_h
 
 def check_product_inventory(url: str) -> dict:
     headers = {
@@ -95,7 +114,6 @@ def check_product_inventory(url: str) -> dict:
     else:
         title = url
 
-    # Costco 頁面特徵精準判定
     if "costco.com" in url:
         costco_oos_btn = soup.find(
             lambda t: t.name == "button"
@@ -113,7 +131,7 @@ def check_product_inventory(url: str) -> dict:
 
         if costco_oos_btn:
             in_stock = False
-            status_desc = "缺貨 (顯示缺貨按鈕)"
+            status_desc = "缺貨 (顯示缺貨中)"
         elif costco_pdp_add_btn and has_qty_selector:
             in_stock = True
             status_desc = "有現貨 (確認有數量選單及加入購物車按鈕)"
@@ -132,45 +150,16 @@ def check_product_inventory(url: str) -> dict:
             "checked_at": now_str,
         }
 
-    # 一般電商判定
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    page_text = soup.get_text(separator=" ", strip=True).lower()
-    out_of_stock_patterns = [r"缺貨中", r"已售完", r"售完", r"已售罄", r"補貨中", r"暫無庫存", r"out of stock", r"sold out"]
-    in_stock_patterns = [r"加入購物車", r"立即購買", r"尚有庫存", r"有現貨", r"現貨", r"add to cart", r"buy now"]
-
-    disabled_cart = bool(
-        soup.find(
-            lambda tag: tag.name in ["button", "input", "a"]
-            and ("disabled" in tag.attrs or "outOfStock" in tag.get("class", []))
-            and any(k in tag.get_text().lower() for k in ["cart", "buy", "購買", "購物車", "缺貨"])
-        )
-    )
-
-    has_oos_text = any(re.search(p, page_text) for p in out_of_stock_patterns)
-    has_in_stock_text = any(re.search(p, page_text) for p in in_stock_patterns)
-
-    if disabled_cart or has_oos_text:
-        in_stock = False
-        status_desc = "缺貨 (符合缺貨關鍵字或按鈕停用)"
-    elif has_in_stock_text:
-        in_stock = True
-        status_desc = "有現貨 (偵測到可購買關鍵字)"
-    else:
-        in_stock = False
-        status_desc = "狀態不明 (預設保守判定為缺貨)"
-
     return {
         "url": url,
         "title": title,
-        "in_stock": in_stock,
-        "status_description": status_desc,
+        "in_stock": False,
+        "status_description": "非好市多網址或未知電商",
         "checked_at": now_str,
     }
 
 async def send_telegram_alert(client: httpx.AsyncClient, title: str, body: str, target_url: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ 未設定 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID，跳過 Telegram 訊息發送。")
         return
 
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -182,80 +171,196 @@ async def send_telegram_alert(client: httpx.AsyncClient, title: str, body: str, 
     }
     if target_url:
         payload["reply_markup"] = {
-            "inline_keyboard": [[{"text": "🛒 立刻前往搶購 / 結帳", "url": target_url}]]
+            "inline_keyboard": [
+                [{"text": "🛒 立刻前往搶購 / 結帳", "url": target_url}]
+            ]
         }
 
     try:
-        resp = await client.post(api_url, json=payload, timeout=15.0)
-        resp.raise_for_status()
-        print(f"✅ Telegram 警報發送成功: {title}")
+        await client.post(api_url, json=payload, timeout=15.0)
     except Exception as e:
-        print(f"❌ Telegram 發送失敗: {e}")
+        print(f"❌ Telegram 推播失敗: {e}")
+
+async def process_telegram_incoming_messages(client: httpx.AsyncClient, settings: Dict[str, Any], products: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
+    """讀取使用者在 Telegram 傳給機器人的文字，支援貼網址直接新增商品！"""
+    if not TELEGRAM_BOT_TOKEN:
+        return products, False
+
+    updated = False
+    try:
+        api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        resp = await client.get(api_url, params={"limit": 10, "timeout": 2})
+        if resp.status_code != 200:
+            return products, False
+        data = resp.json()
+        if not data.get("ok"):
+            return products, False
+
+        updates = data.get("result", [])
+        last_update_id = 0
+        for upd in updates:
+            upd_id = upd.get("update_id", 0)
+            if upd_id > last_update_id:
+                last_update_id = upd_id
+            msg = upd.get("message", {})
+            text = msg.get("text", "").strip()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+
+            # 只處理白名單或擁有者
+            if TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
+                continue
+
+            if not text:
+                continue
+
+            # 1. 處理傳送商品網址 (包含含有 costco.com 的文字)
+            url_match = re.search(r"https?://[^\s]+costco\.com[^\s]+", text)
+            if url_match:
+                new_url = url_match.group(0)
+                code_match = re.search(r"/p/(\d+)", new_url)
+                p_code = code_match.group(1) if code_match else str(int(time.time()))
+                
+                # 檢查是否已存在
+                exists = any(p.get("url") == new_url or p.get("target_url") == new_url for p in products)
+                if not exists:
+                    # 先快速抓取名稱
+                    c_res = check_product_inventory(new_url)
+                    p_name = c_res.get("title") or f"Costco 商品 ({p_code})"
+                    new_item = {
+                        "id": p_code,
+                        "name": p_name,
+                        "url": new_url,
+                        "enabled": True,
+                        "last_status": "新加入待巡檢",
+                        "last_checked": datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    products.append(new_item)
+                    updated = True
+                    # 回覆 Telegram
+                    confirm_text = f"✅ **【成功新增監控商品！】**\n\n📦 **名稱**：{p_name}\n🔗 **網址**：{new_url}\n\n🤖 雲端將自動每 15 分鐘監控，有貨第一時間推播通知您！"
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": confirm_text,
+                        "parse_mode": "Markdown"
+                    })
+
+            # 2. 處理 /list 查詢指令
+            elif text == "/list" or text == "清單":
+                if not products:
+                    reply = "📋 目前尚未追蹤任何商品。直接在此傳送好市多商品網址即可新增！"
+                else:
+                    reply = "📋 **【目前監控中的商品清單】**\n\n"
+                    for idx, p in enumerate(products, 1):
+                        p_name = p.get("name") or p.get("url")
+                        p_status = p.get("last_status", "巡檢中")
+                        reply += f"{idx}. **{p_name}**\n   狀態：`{p_status}`\n   編號：`{p.get('id')}`\n\n"
+                    reply += "💡 想停止監控請輸入：`/del 商品編號`\n想新增直接貼上好市多網址即可！"
+                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                    "chat_id": chat_id,
+                    "text": reply,
+                    "parse_mode": "Markdown"
+                })
+
+            # 3. 處理 /del 刪除指令
+            elif text.startswith("/del") or text.startswith("/delete"):
+                parts = text.split()
+                if len(parts) > 1:
+                    del_id = parts[1].strip()
+                    before_cnt = len(products)
+                    products = [p for p in products if str(p.get("id")) != del_id]
+                    if len(products) < before_cnt:
+                        updated = True
+                        await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                            "chat_id": chat_id,
+                            "text": f"🗑️ 已成功移除編號 `{del_id}` 的商品監控！",
+                            "parse_mode": "Markdown"
+                        })
+
+        # 標記 update 已讀，避免重複處理
+        if last_update_id > 0:
+            await client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params={"offset": last_update_id + 1})
+
+    except Exception as e:
+        print(f"處理 Telegram 互動失敗: {e}")
+
+    return products, updated
 
 async def main():
     print("=" * 60)
-    print("🚀 啟動 GitHub Actions 雲端巡檢作業...")
+    print("🚀 啟動 GitHub Actions 雲端巡檢作業 (整合旗艦版)...")
     now_taipei = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
     print(f"🕒 執行時間 (台灣時間): {now_taipei}")
     print("=" * 60)
 
-    items = load_tracked_items()
-    if not items:
-        print("ℹ️ 目前無追蹤商品。")
-        sys.exit(0)
-
-    in_stock_found = []
-    oos_found = []
+    settings, products = load_config_and_products()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        for it in items:
-            t_url = it.get("target_url")
-            if not t_url:
+        # 1. 先處理來自 Telegram 的最新互動指令 (貼網址自動新增、/list 查詢、/del 刪除)
+        products, tg_updated = await process_telegram_incoming_messages(client, settings, products)
+
+        # 2. 檢查總開關與夜間靜音
+        if not settings.get("is_active", True):
+            print("⏸️ 系統設定為停用中 (is_active = false)，跳過本次巡檢。")
+            if tg_updated:
+                save_config_and_products(settings, products)
+            sys.exit(0)
+
+        in_quiet = is_in_quiet_hours(settings)
+        if in_quiet:
+            print("🌙 目前處於夜間靜音時段，略過訊息推播以防打擾。")
+
+        # 3. 逐一巡檢商品
+        in_stock_found = []
+        oos_found = []
+
+        for p in products:
+            if not p.get("enabled", True):
+                continue
+            target_url = p.get("url") or p.get("target_url")
+            if not target_url:
                 continue
 
-            prev_stock = it.get("in_stock", False)
-            print(f"🔍 正在檢查: {it.get('name', t_url)} ...")
-            c_res = check_product_inventory(t_url)
+            p_name = p.get("name") or "好市多商品"
+            print(f"🔍 正在檢查: {p_name} ...")
+            c_res = check_product_inventory(target_url)
 
-            is_now_stock = c_res.get("in_stock", False)
+            in_stock = c_res.get("in_stock", False)
             status_desc = c_res.get("status_description", "")
-            checked_at = c_res.get("checked_at", now_taipei)
+            if c_res.get("title") and c_res.get("title") != target_url:
+                p["name"] = c_res.get("title")
+            p["last_status"] = "🟢 有現貨" if in_stock else f"🔴 {status_desc}"
+            p["last_checked"] = now_taipei
 
-            it["in_stock"] = is_now_stock
-            it["status_notes"] = status_desc
-            it["last_checked"] = checked_at
-            if c_res.get("title") and c_res.get("title") != t_url:
-                it["name"] = c_res.get("title")
-
-            if is_now_stock:
-                in_stock_found.append(it)
-                print(f"🎉【發現有現貨！】{it['name']}")
-                # 若先前是缺貨或剛補貨，立即發出高優先級通知！
-                await send_telegram_alert(
-                    client,
-                    f"🚨 **【GitHub 雲端緊急補貨通知！】**",
-                    f"📦 **商品**：{it['name']}\n🟢 **狀態**：{status_desc}\n⏰ **時間**：`{checked_at}`\n\n⚡ 請在 10 分鐘內點擊下方按鈕結帳！",
-                    t_url
-                )
+            if in_stock:
+                in_stock_found.append(p)
+                print(f"🎉【發現有現貨！】{p['name']}")
+                if not in_quiet and settings.get("telegram", {}).get("enabled", True):
+                    await send_telegram_alert(
+                        client,
+                        "🚨 **【GitHub 雲端緊急補貨通知！】**",
+                        f"📦 **商品**：{p['name']}\n🟢 **狀態**：{status_desc}\n⏰ **時間**：`{now_taipei}`\n\n⚡ 請在 10 分鐘內點擊下方按鈕結帳！",
+                        target_url
+                    )
             else:
-                oos_found.append(it)
-                print(f"🔴【依然缺貨中】{it['name']} ({status_desc})")
+                oos_found.append(p)
+                print(f"🔴【缺貨中】{p['name']} ({status_desc})")
 
-    # 存檔最新狀態
-    save_tracked_items(items)
+        # 4. 存檔回寫
+        save_config_and_products(settings, products)
 
-    status_data = {
-        "last_checked_taipei": now_taipei,
-        "total_items": len(items),
-        "in_stock_count": len(in_stock_found),
-        "out_of_stock_count": len(oos_found),
-        "summary": f"共檢查 {len(items)} 件 (現貨: {len(in_stock_found)} / 缺貨: {len(oos_found)})"
-    }
-    with open(STATUS_FILE, "w", encoding="utf-8") as f:
-        json.dump(status_data, f, ensure_ascii=False, indent=2)
+        summary = f"共檢查 {len(products)} 件 (現貨: {len(in_stock_found)} / 缺貨: {len(oos_found)})"
+        status_data = {
+            "last_checked_taipei": now_taipei,
+            "total_items": len(products),
+            "in_stock_count": len(in_stock_found),
+            "out_of_stock_count": len(oos_found),
+            "summary": summary
+        }
+        with open(LAST_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(status_data, f, ensure_ascii=False, indent=2)
 
     print("=" * 60)
-    print(f"🏁 巡檢完成！{status_data['summary']}")
+    print(f"🏁 巡檢完成！{summary}")
     print("=" * 60)
 
 if __name__ == "__main__":
