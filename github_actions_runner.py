@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-GitHub Actions 專用無伺服器雲端監控核心腳本 (Telegram 全功能控制台旗艦版)
+GitHub Actions 專用無伺服器雲端監控核心腳本 (Telegram 視覺化互動按鈕旗艦版)
 - 100% 免費、免開電腦、免 CMD、免信用卡
-- 整合 settings 與 products 於單一 tracked_products.json
-- Telegram 支援全功能指令 (開關/靜音時段/缺貨週期/預約搶登/商品管理/即時檢查)
+- 全視覺化按鈕 (Inline Keyboards & Reply Keyboards)，小白直接點擊免背指令
+- 整合 settings / products / scheduled_tasks 於單一 tracked_products.json
 """
 
 import asyncio
@@ -161,6 +161,25 @@ def check_product_inventory(url: str) -> dict:
         "checked_at": now_str,
     }
 
+def get_main_menu_markup():
+    """返回 Telegram 訊息下方的視覺化互動按鈕選單 (點一下就觸發)"""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📋 檢視商品清單", "callback_data": "menu_list"},
+                {"text": "🔍 立即觸發全檢", "callback_data": "menu_check"}
+            ],
+            [
+                {"text": "⚙️ 系統設定儀表板", "callback_data": "menu_status"},
+                {"text": "🌙 快速切換靜音", "callback_data": "toggle_quiet"}
+            ],
+            [
+                {"text": "⚡ 開啟/暫停總監控", "callback_data": "toggle_active"},
+                {"text": "❓ 操作與功能說明", "callback_data": "menu_help"}
+            ]
+        ]
+    }
+
 async def send_telegram_alert(client: httpx.AsyncClient, title: str, body: str, target_url: str = "", buttons: list = None):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -177,9 +196,12 @@ async def send_telegram_alert(client: httpx.AsyncClient, title: str, body: str, 
     elif target_url:
         payload["reply_markup"] = {
             "inline_keyboard": [
-                [{"text": "🛒 立刻前往搶購 / 結帳", "url": target_url}]
+                [{"text": "🛒 立刻前往搶購 / 結帳", "url": target_url}],
+                [{"text": "📱 開啟主控制台", "callback_data": "menu_main"}]
             ]
         }
+    else:
+        payload["reply_markup"] = get_main_menu_markup()
 
     try:
         await client.post(api_url, json=payload, timeout=15.0)
@@ -187,7 +209,7 @@ async def send_telegram_alert(client: httpx.AsyncClient, title: str, body: str, 
         print(f"❌ Telegram 推播失敗: {e}")
 
 async def process_telegram_incoming_messages(client: httpx.AsyncClient, settings: Dict[str, Any], products: List[Dict[str, Any]], scheduled_tasks: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], bool, bool]:
-    """處理 Telegram 指令：支援網頁所有功能的指令化操作與設定！"""
+    """處理 Telegram 點擊按鈕 (Callback Queries) 與文字輸入"""
     if not TELEGRAM_BOT_TOKEN:
         return settings, products, scheduled_tasks, False, False
 
@@ -196,7 +218,7 @@ async def process_telegram_incoming_messages(client: httpx.AsyncClient, settings
 
     try:
         api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-        resp = await client.get(api_url, params={"limit": 20, "timeout": 2})
+        resp = await client.get(api_url, params={"limit": 30, "timeout": 2})
         if resp.status_code != 200:
             return settings, products, scheduled_tasks, False, False
         data = resp.json()
@@ -209,6 +231,150 @@ async def process_telegram_incoming_messages(client: httpx.AsyncClient, settings
             upd_id = upd.get("update_id", 0)
             if upd_id > last_update_id:
                 last_update_id = upd_id
+
+            # -------------------------------------------------------------
+            # A. 處理按鈕點擊 (Callback Query) ➡️ 免背指令！點一下就觸發！
+            # -------------------------------------------------------------
+            cb = upd.get("callback_query")
+            if cb:
+                cb_id = cb.get("id")
+                cb_data = cb.get("data", "")
+                from_chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                msg_id = cb.get("message", {}).get("message_id")
+
+                # 回應 Telegram 按鈕點擊狀態，消除讀取轉圈圈
+                try:
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id})
+                except Exception:
+                    pass
+
+                if TELEGRAM_CHAT_ID and from_chat_id != TELEGRAM_CHAT_ID:
+                    continue
+
+                if cb_data == "menu_main" or cb_data == "menu_help":
+                    help_text = (
+                        "🎛️ **【好市多雲端智慧監控控制台】**\n\n"
+                        "點選下方任一按鈕即可操作，**完全免背指令**：\n\n"
+                        "💡 **想新增商品？**\n"
+                        "只要在對話框直接「貼上好市多商品網址」送出，機器人就會自動加入！"
+                    )
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                        "chat_id": from_chat_id,
+                        "text": help_text,
+                        "parse_mode": "Markdown",
+                        "reply_markup": get_main_menu_markup()
+                    })
+
+                elif cb_data == "menu_list":
+                    if not products:
+                        reply = "📋 目前尚未追蹤任何商品。直接貼上好市多商品網址即可新增！"
+                        kb = get_main_menu_markup()
+                    else:
+                        reply = "📋 **【目前監控中的商品清單】**\n\n"
+                        btn_rows = []
+                        for idx, p in enumerate(products, 1):
+                            p_name = p.get("name") or p.get("url")
+                            p_status = p.get("last_status", "巡檢中")
+                            p_id = p.get("id")
+                            reply += f"{idx}. **{p_name}**\n   狀態：`{p_status}`\n   編號：`{p_id}`\n\n"
+                            btn_rows.append([
+                                {"text": f"🛒 前往 #{idx}", "url": p.get("url", "")},
+                                {"text": f"🗑️ 刪除 #{idx}", "callback_data": f"del_{p_id}"}
+                            ])
+                        btn_rows.append([{"text": "🔙 返回主選單", "callback_data": "menu_main"}])
+                        kb = {"inline_keyboard": btn_rows}
+
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                        "chat_id": from_chat_id,
+                        "text": reply,
+                        "parse_mode": "Markdown",
+                        "reply_markup": kb
+                    })
+
+                elif cb_data.startswith("del_"):
+                    del_id = cb_data.replace("del_", "").strip()
+                    before_cnt = len(products)
+                    products = [p for p in products if str(p.get("id")) != del_id]
+                    if len(products) < before_cnt:
+                        updated = True
+                        del_reply = f"🗑️ 已成功將商品 (編號 `{del_id}`) 從清單中刪除！"
+                    else:
+                        del_reply = f"⚠️ 找不到該商品。"
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                        "chat_id": from_chat_id,
+                        "text": del_reply,
+                        "parse_mode": "Markdown",
+                        "reply_markup": get_main_menu_markup()
+                    })
+
+                elif cb_data == "menu_status":
+                    now_str = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+                    is_act = "🟢 運作中 (ON)" if settings.get("is_active", True) else "🔴 已暫停 (OFF)"
+                    q_on = "🟢 已啟用" if settings.get("quiet_hours_enabled", True) else "⚪ 已停用"
+                    q_range = f"{settings.get('quiet_hours_start', 1):02d}:00 ~ {settings.get('quiet_hours_end', 5):02d}:00"
+                    oos_h = f"{settings.get('oos_periodic_notify_hours', 4)} 小時"
+
+                    status_reply = (
+                        f"📊 **【系統目前狀態儀表板】**\n\n"
+                        f"⚡ **總監控狀態**：{is_act}\n"
+                        f"⏰ **巡檢週期**：每 `15 分鐘` (GitHub 24/7 全自動)\n"
+                        f"🌙 **夜間靜音時段**：{q_on} (`{q_range}`)\n"
+                        f"📢 **缺貨提醒週期**：每 `{oos_h}` 一次\n"
+                        f"📦 **商品數量**：共 `{len(products)}` 件\n"
+                        f"🕒 **目前伺服器時間**：`{now_str}`"
+                    )
+                    kb = {
+                        "inline_keyboard": [
+                            [
+                                {"text": "⚡ 切換總開關 (ON/OFF)", "callback_data": "toggle_active"},
+                                {"text": "🌙 切換靜音 (開/關)", "callback_data": "toggle_quiet"}
+                            ],
+                            [
+                                {"text": "🔍 立即巡檢一次", "callback_data": "menu_check"},
+                                {"text": "🔙 返回主選單", "callback_data": "menu_main"}
+                            ]
+                        ]
+                    }
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                        "chat_id": from_chat_id,
+                        "text": status_reply,
+                        "parse_mode": "Markdown",
+                        "reply_markup": kb
+                    })
+
+                elif cb_data == "toggle_active":
+                    settings["is_active"] = not settings.get("is_active", True)
+                    updated = True
+                    act_state = "🟢 運作中 (ON)" if settings["is_active"] else "🔴 已暫停 (OFF)"
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                        "chat_id": from_chat_id,
+                        "text": f"⚡ **總監控狀態已切換為**：{act_state}",
+                        "parse_mode": "Markdown",
+                        "reply_markup": get_main_menu_markup()
+                    })
+
+                elif cb_data == "toggle_quiet":
+                    settings["quiet_hours_enabled"] = not settings.get("quiet_hours_enabled", True)
+                    updated = True
+                    q_state = "🟢 已開啟夜間防打擾" if settings["quiet_hours_enabled"] else "☀️ 已關閉夜間防打擾 (24H通知)"
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                        "chat_id": from_chat_id,
+                        "text": f"🌙 **夜間靜音設定已切換**：{q_state}",
+                        "parse_mode": "Markdown",
+                        "reply_markup": get_main_menu_markup()
+                    })
+
+                elif cb_data == "menu_check":
+                    trigger_immediate_check = True
+                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                        "chat_id": from_chat_id,
+                        "text": "🔍 **收到立即巡檢要求！** 正在即時抓取所有商品最新庫存...",
+                        "parse_mode": "Markdown"
+                    })
+
+            # -------------------------------------------------------------
+            # B. 處理純文字訊息 (貼網址自動加入 / 任何文字叫出主選單按鈕)
+            # -------------------------------------------------------------
             msg = upd.get("message", {})
             text = msg.get("text", "").strip()
             chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -219,9 +385,7 @@ async def process_telegram_incoming_messages(client: httpx.AsyncClient, settings
             if not text:
                 continue
 
-            # -------------------------------------------------------------
-            # 1. 貼商品網址直接新增
-            # -------------------------------------------------------------
+            # 1. 貼網址直接新增
             url_match = re.search(r"https?://[^\s]+costco\.com[^\s]+", text)
             if url_match:
                 new_url = url_match.group(0)
@@ -252,253 +416,26 @@ async def process_telegram_incoming_messages(client: httpx.AsyncClient, settings
                     await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                         "chat_id": chat_id,
                         "text": reply,
-                        "parse_mode": "Markdown"
+                        "parse_mode": "Markdown",
+                        "reply_markup": get_main_menu_markup()
                     })
 
-            # -------------------------------------------------------------
-            # 2. /help 或 /start - 完整控制台指令選單
-            # -------------------------------------------------------------
-            elif text in ["/help", "/start", "說明", "幫助", "功能"]:
-                help_text = (
-                    "🛠️ **【好市多雲端智慧監控控制台】**\n\n"
-                    "您可以在此直接控制所有網頁功能：\n\n"
-                    "📋 **商品管理**：\n"
-                    "• 直接貼好市多網址 ➡️ 立即加入監控\n"
-                    "• `/list` ➡️ 檢視目前所有商品與庫存現況\n"
-                    "• `/del <編號>` ➡️ 移除指定商品 (如 `/del 142997`)\n\n"
-                    "⚙️ **系統開關與時間週期**：\n"
-                    "• `/status` ➡️ 查看目前所有時間週期與開關設定\n"
-                    "• `/on` 啟用總監控 / `/off` 暫停總監控\n"
-                    "• `/quiet <開關>` ➡️ 夜間靜音 (如 `/quiet on` 或 `/quiet off`)\n"
-                    "• `/quiet_time <開始> <結束>` ➡️ 設定靜音時段 (如 `/quiet_time 1 5`)\n"
-                    "• `/oos_hours <小時>` ➡️ 設定缺貨每幾小時提醒 (如 `/oos_hours 4`)\n\n"
-                    "⏰ **預約定時與檢查**：\n"
-                    "• `/check` ➡️ 立即觸發一次全商品雲端巡檢\n"
-                    "• `/reserve <時間> <網址>` ➡️ 預約搶購通知 (如 `/reserve 2026-11-21 10:00 https://...`)\n"
-                    "• `/task_list` ➡️ 查看預約搶購排程清單"
+            # 2. 任何輸入文字或 /start 都送出全視覺化選單
+            else:
+                main_msg = (
+                    "🎛️ **【好市多雲端智慧監控控制台】**\n\n"
+                    "歡迎使用！請直接點擊下方按鈕進行操作：\n\n"
+                    "• 點擊 **【📋 檢視商品清單】** 可查看商品與單鍵刪除\n"
+                    "• 點擊 **【🔍 立即觸發全檢】** 立即爬蟲更新最新狀態\n"
+                    "• 點擊 **【⚙️ 系統設定儀表板】** 查看各項週期與開關\n"
+                    "• 想新增商品？**直接貼上好市多商品網址**即可！"
                 )
                 await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                     "chat_id": chat_id,
-                    "text": help_text,
-                    "parse_mode": "Markdown"
+                    "text": main_msg,
+                    "parse_mode": "Markdown",
+                    "reply_markup": get_main_menu_markup()
                 })
-
-            # -------------------------------------------------------------
-            # 3. /status - 查看完整時間設定與系統儀表板
-            # -------------------------------------------------------------
-            elif text in ["/status", "狀態", "設定"]:
-                now_str = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
-                is_act = "🟢 運作中 (ON)" if settings.get("is_active", True) else "🔴 已暫停 (OFF)"
-                q_on = "🟢 已啟用" if settings.get("quiet_hours_enabled", True) else "⚪ 已停用"
-                q_range = f"{settings.get('quiet_hours_start', 1):02d}:00 ~ {settings.get('quiet_hours_end', 5):02d}:00"
-                oos_h = f"{settings.get('oos_periodic_notify_hours', 4)} 小時"
-                
-                status_reply = (
-                    f"📊 **【雲端監控儀表板與時間設定】**\n\n"
-                    f"⚡ **總監控狀態**：{is_act}\n"
-                    f"⏰ **雲端巡檢週期**：每 `15 分鐘` (GitHub Actions 24/7)\n"
-                    f"🌙 **夜間防打擾靜音**：{q_on} (`{q_range}`)\n"
-                    f"📢 **缺貨重複提醒週期**：每 `{oos_h}` 一次\n"
-                    f"📦 **目前追蹤商品**：共 `{len(products)}` 件\n"
-                    f"🕒 **目前伺服器時間**：`{now_str}`\n\n"
-                    f"💡 調整設定範例：\n"
-                    f"• 更改靜音時間：`/quiet_time 2 6`\n"
-                    f"• 更改提醒週期：`/oos_hours 2`\n"
-                    f"• 立即全檢：`/check`"
-                )
-                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                    "chat_id": chat_id,
-                    "text": status_reply,
-                    "parse_mode": "Markdown"
-                })
-
-            # -------------------------------------------------------------
-            # 4. /on 與 /off - 總監控開關
-            # -------------------------------------------------------------
-            elif text in ["/on", "開啟"]:
-                settings["is_active"] = True
-                updated = True
-                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                    "chat_id": chat_id,
-                    "text": "🟢 **【總監控已啟用！】** 雲端將持續每 15 分鐘巡檢好市多商品。",
-                    "parse_mode": "Markdown"
-                })
-
-            elif text in ["/off", "關閉", "暫停"]:
-                settings["is_active"] = False
-                updated = True
-                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                    "chat_id": chat_id,
-                    "text": "🔴 **【總監控已暫停！】** 雲端將暫停所有商品庫存巡檢與推播。",
-                    "parse_mode": "Markdown"
-                })
-
-            # -------------------------------------------------------------
-            # 5. /quiet - 靜音開關與時間時段設定
-            # -------------------------------------------------------------
-            elif text.startswith("/quiet_time"):
-                parts = text.split()
-                if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
-                    s_h, e_h = int(parts[1]), int(parts[2])
-                    if 0 <= s_h <= 23 and 0 <= e_h <= 23:
-                        settings["quiet_hours_start"] = s_h
-                        settings["quiet_hours_end"] = e_h
-                        settings["quiet_hours_enabled"] = True
-                        updated = True
-                        await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                            "chat_id": chat_id,
-                            "text": f"🌙 **【夜間靜音時段已更新】**：`{s_h:02d}:00 ~ {e_h:02d}:00` 期間不推播通知。",
-                            "parse_mode": "Markdown"
-                        })
-                else:
-                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": "⚠️ 格式錯誤！範例：`/quiet_time 1 5` (代表凌晨 1 點到 5 點靜音)",
-                        "parse_mode": "Markdown"
-                    })
-
-            elif text.startswith("/quiet"):
-                parts = text.split()
-                if len(parts) > 1:
-                    arg = parts[1].lower()
-                    if arg in ["on", "true", "開"]:
-                        settings["quiet_hours_enabled"] = True
-                        updated = True
-                        await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                            "chat_id": chat_id,
-                            "text": f"🌙 **【夜間防打擾已開啟】** (時段: `{settings.get('quiet_hours_start', 1):02d}:00 ~ {settings.get('quiet_hours_end', 5):02d}:00`)",
-                            "parse_mode": "Markdown"
-                        })
-                    elif arg in ["off", "false", "關"]:
-                        settings["quiet_hours_enabled"] = False
-                        updated = True
-                        await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                            "chat_id": chat_id,
-                            "text": "☀️ **【夜間防打擾已停用】** 24 小時有補貨皆立即推播。",
-                            "parse_mode": "Markdown"
-                        })
-
-            # -------------------------------------------------------------
-            # 6. /oos_hours - 缺貨提醒間隔 (小時)
-            # -------------------------------------------------------------
-            elif text.startswith("/oos_hours"):
-                parts = text.split()
-                if len(parts) > 1 and parts[1].replace(".", "").isdigit():
-                    hours = float(parts[1])
-                    settings["oos_periodic_notify_hours"] = hours
-                    updated = True
-                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": f"📢 **【缺貨提醒週期已更新】**：每隔 `{hours}` 小時報告一次缺貨商品狀態。",
-                        "parse_mode": "Markdown"
-                    })
-                else:
-                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": "⚠️ 請輸入小時數字！範例：`/oos_hours 4` 或 `/oos_hours 2`",
-                        "parse_mode": "Markdown"
-                    })
-
-            # -------------------------------------------------------------
-            # 7. /list - 查詢商品清單
-            # -------------------------------------------------------------
-            elif text in ["/list", "清單", "商品"]:
-                if not products:
-                    reply = "📋 目前尚未追蹤任何商品。直接在此傳送好市多商品網址即可新增！"
-                else:
-                    reply = "📋 **【目前監控中的商品清單】**\n\n"
-                    for idx, p in enumerate(products, 1):
-                        p_name = p.get("name") or p.get("url")
-                        p_status = p.get("last_status", "巡檢中")
-                        p_id = p.get("id")
-                        reply += f"{idx}. **{p_name}**\n   狀態：`{p_status}`\n   編號：`{p_id}`\n\n"
-                    reply += "💡 想停止監控請輸入：`/del 商品編號`\n想新增直接貼上好市多網址即可！"
-                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                    "chat_id": chat_id,
-                    "text": reply,
-                    "parse_mode": "Markdown"
-                })
-
-            # -------------------------------------------------------------
-            # 8. /del - 刪除商品
-            # -------------------------------------------------------------
-            elif text.startswith("/del") or text.startswith("/delete"):
-                parts = text.split()
-                if len(parts) > 1:
-                    del_id = parts[1].strip()
-                    before_cnt = len(products)
-                    products = [p for p in products if str(p.get("id")) != del_id]
-                    if len(products) < before_cnt:
-                        updated = True
-                        await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                            "chat_id": chat_id,
-                            "text": f"🗑️ 已成功移除編號 `{del_id}` 的商品監控！",
-                            "parse_mode": "Markdown"
-                        })
-                    else:
-                        await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                            "chat_id": chat_id,
-                            "text": f"⚠️ 找不到編號 `{del_id}` 的商品，請輸入 `/list` 查詢編號。",
-                            "parse_mode": "Markdown"
-                        })
-
-            # -------------------------------------------------------------
-            # 9. /check - 立即觸發雲端全商品巡檢
-            # -------------------------------------------------------------
-            elif text in ["/check", "檢查", "巡檢"]:
-                trigger_immediate_check = True
-                await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                    "chat_id": chat_id,
-                    "text": "🔍 **收到立即巡檢指令！** 正在即時抓取所有商品最新庫存...",
-                    "parse_mode": "Markdown"
-                })
-
-            # -------------------------------------------------------------
-            # 10. /reserve - 預約定時搶購/提醒任務
-            # -------------------------------------------------------------
-            elif text.startswith("/reserve") or text.startswith("/預約"):
-                parts = text.split(maxsplit=2)
-                # 格式: /reserve 2026-11-21 10:00:00 https://...
-                if len(parts) >= 3:
-                    exec_time = parts[1].strip()
-                    res_url = parts[2].strip()
-                    task_id = f"task_{int(time.time())}"
-                    task = {
-                        "id": task_id,
-                        "execute_at": exec_time,
-                        "url": res_url,
-                        "status": "pending"
-                    }
-                    scheduled_tasks.append(task)
-                    updated = True
-                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": f"⏰ **【預約排程已建立】**\n\n時間：`{exec_time}`\n目標：{res_url}\n屆時雲端將即刻發送搶登推播！",
-                        "parse_mode": "Markdown"
-                    })
-                else:
-                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": "⚠️ 格式：`/reserve <預約時間> <商品網址>`\n範例：`/reserve 10:00 https://www.costco.com.tw/p/142997`",
-                        "parse_mode": "Markdown"
-                    })
-
-            elif text in ["/task_list", "預約清單"]:
-                if not scheduled_tasks:
-                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": "📅 目前無任何預約排程任務。",
-                        "parse_mode": "Markdown"
-                    })
-                else:
-                    t_reply = "📅 **【預約排程任務清單】**\n\n"
-                    for t in scheduled_tasks:
-                        t_reply += f"• 時間：`{t.get('execute_at')}`\n  目標：{t.get('url')}\n  狀態：`{t.get('status')}`\n\n"
-                    await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": t_reply,
-                        "parse_mode": "Markdown"
-                    })
 
         if last_update_id > 0:
             await client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", params={"offset": last_update_id + 1})
@@ -510,7 +447,7 @@ async def process_telegram_incoming_messages(client: httpx.AsyncClient, settings
 
 async def main():
     print("=" * 60)
-    print("🚀 啟動 GitHub Actions 雲端巡檢作業 (Telegram 全功能旗艦版)...")
+    print("🚀 啟動 GitHub Actions 雲端巡檢作業 (Telegram 全按鈕旗艦版)...")
     now_taipei = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
     print(f"🕒 執行時間 (台灣時間): {now_taipei}")
     print("=" * 60)
@@ -518,12 +455,10 @@ async def main():
     settings, products, scheduled_tasks = load_config_and_products()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # 1. 處理 Telegram 傳來的各項設定與指令
         settings, products, scheduled_tasks, tg_updated, trigger_immediate = await process_telegram_incoming_messages(
             client, settings, products, scheduled_tasks
         )
 
-        # 2. 檢查總開關 (若為手動 /check 則強制執行)
         if not settings.get("is_active", True) and not trigger_immediate:
             print("⏸️ 系統設定為停用中 (is_active = false)，跳過本次巡檢。")
             if tg_updated:
@@ -534,7 +469,6 @@ async def main():
         if in_quiet and not trigger_immediate:
             print("🌙 目前處於夜間靜音時段，略過訊息推播以防打擾。")
 
-        # 3. 逐一巡檢商品
         in_stock_found = []
         oos_found = []
 
@@ -570,15 +504,14 @@ async def main():
                 oos_found.append(p)
                 print(f"🔴【缺貨中】{p['name']} ({status_desc})")
 
-        # 若使用者敲 /check，主動回傳巡檢結果總覽
+        # 若使用者按了【立即巡檢】，回傳詳細清單與按鈕
         if trigger_immediate:
-            res_msg = f"🏁 **【立即巡檢完成報告】**\n\n"
+            res_msg = f"🏁 **【立即巡檢報告完成】**\n\n"
             for it in products:
                 res_msg += f"• **{it.get('name')}**：`{it.get('last_status')}`\n"
             res_msg += f"\n⏰ 檢查時間：`{now_taipei}`"
             await send_telegram_alert(client, "📋 **巡檢報告**", res_msg)
 
-        # 4. 存檔回寫
         save_config_and_products(settings, products, scheduled_tasks)
 
         summary = f"共檢查 {len(products)} 件 (現貨: {len(in_stock_found)} / 缺貨: {len(oos_found)})"
