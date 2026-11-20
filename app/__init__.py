@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .agent import app
-
-__all__ = ["app"]
+try:
+    from .agent import app
+    __all__ = ["app"]
+except ImportError:
+    # 支援純本地離線執行模式 (無需安裝 Google ADK 雲端套件)
+    app = None
+    __all__ = []
