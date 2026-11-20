@@ -1015,4 +1015,4 @@ if __name__ == "__main__":
     print("🌐 控制台網址: http://localhost:8000")
     print("📁 資料檔案: " + str(DATA_FILE))
     print("=" * 65)
-    uvicorn.run("run_local_app.py:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
