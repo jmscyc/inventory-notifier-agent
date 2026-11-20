@@ -155,7 +155,7 @@ def save_tracked_items(items: list):
     except Exception as e:
         print(f"⚠️ 儲存商品清單失敗: {e}")
 
-def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes: str, item_id: str = "", preferred_option: str = "") -> dict:
+def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes: str, item_id: str = "", preferred_option: str = "", current_price: str = "") -> dict:
     items = load_tracked_items()
     now_str = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -177,10 +177,22 @@ def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes:
             it["last_checked"] = now_str
             if preferred_option:
                 it["preferred_option"] = preferred_option
+            if current_price:
+                it["current_price"] = current_price
+                history = it.get("price_history", [])
+                # 若歷史為空或價格不同，記錄價格變動
+                if not history or history[-1].get("price") != current_price:
+                    history.append({"time": now_str, "price": current_price, "in_stock": in_stock})
+                    if len(history) > 30:
+                        history.pop(0)
+                    it["price_history"] = history
             updated = True
             break
 
     if not updated:
+        init_history = []
+        if current_price:
+            init_history.append({"time": now_str, "price": current_price, "in_stock": in_stock})
         items.append({
             "id": item_id,
             "name": name or target_url,
@@ -189,6 +201,8 @@ def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes:
             "status_notes": status_notes,
             "last_checked": now_str,
             "preferred_option": preferred_option or "",
+            "current_price": current_price or "",
+            "price_history": init_history
         })
 
     save_tracked_items(items)
@@ -268,12 +282,21 @@ def check_product_inventory(url: str) -> dict:
             in_stock = False
             status_desc = "目前缺貨 (未發現加入購物車按鈕)"
 
+        # 擷取商品價格 (例如: $1,299 或 1299)
+        price_val = ""
+        price_tag = soup.find(class_=re.compile(r"price|product-price|total-price", re.I)) or soup.find(id=re.compile(r"price", re.I))
+        if price_tag:
+            price_val = price_tag.get_text().strip()
+        elif match_p := re.search(r"(\$|NT\$|NT\s?)\s?(\d{1,3}(,\d{3})*(\.\d+)?)", html_content):
+            price_val = match_p.group(0).strip()
+
         return {
             "url": url,
             "title": title,
             "in_stock": in_stock,
             "status_description": status_desc,
             "checked_at": now_str,
+            "price": price_val
         }
 
     # 一般電商判定
@@ -1184,15 +1207,42 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 <small class="text-muted d-block" style="font-size: 0.75rem;">關閉時將停在最後授權頁等您確認；開啟則直接代您按下完成購買。</small>
               </div>
 
+              <!-- 電商會員登入帳密 (小白友善：免抓 Cookie，輸入帳密自動登入搶購) -->
+              <div class="p-3 mb-3 bg-light rounded-3 border">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                  <span class="small fw-bold text-dark"><i class="bi bi-person-badge text-primary me-1"></i>電商會員帳號綁定 (自動代登入)</span>
+                  <span class="badge bg-success" id="accountStatusBadge">已就緒</span>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label small mb-0">會員登入 Email / 帳號</label>
+                  <input type="email" id="cfgAccountEmail" class="form-control form-control-sm" placeholder="example@email.com" autocomplete="off">
+                </div>
+                <div class="mb-2">
+                  <label class="form-label small mb-0">會員密碼 (點擊儲存自動加密存於本地)</label>
+                  <input type="password" id="cfgAccountPassword" class="form-control form-control-sm" placeholder="••••••••" autocomplete="off">
+                </div>
+                <div class="d-flex justify-content-between align-items-center mt-2">
+                  <small class="text-muted" style="font-size: 0.72rem;">✨ 免手動抓 Cookie！搶購引擎會自動代您登入加車。</small>
+                  <button type="button" class="btn btn-sm btn-outline-primary" style="font-size: 0.75rem;" onclick="testAccountLoginUI()">
+                    🔑 測試登入
+                  </button>
+                </div>
+              </div>
+
+              <!-- 進階 Cookie 選填區 (預設折疊) -->
               <div class="mb-3">
-                <label class="form-label small fw-bold mb-1">電商登入 Cookie (推薦貼上 Cookie JSON)</label>
-                <textarea id="cfgCookiesJson" rows="2" class="form-control form-control-sm" placeholder='可透過瀏覽器擴充套件導出 Cookie JSON 貼於此處'></textarea>
-                <div class="small text-success mt-1" id="cookieStatusText"></div>
+                <a class="small text-muted text-decoration-none" data-bs-toggle="collapse" href="#advancedCookieCollapse" role="button">
+                  <i class="bi bi-chevron-down me-1"></i>進階工程師選項：手動貼 Cookie JSON (選填)
+                </a>
+                <div class="collapse mt-2" id="advancedCookieCollapse">
+                  <textarea id="cfgCookiesJson" rows="2" class="form-control form-control-sm" placeholder='若有現成 Cookie JSON 可選填貼於此處'></textarea>
+                  <div class="small text-success mt-1" id="cookieStatusText"></div>
+                </div>
               </div>
 
               <div class="d-flex gap-2 mb-3">
                 <button class="btn btn-warning flex-grow-1 fw-bold py-2" onclick="saveAutobuyConfig()">
-                  <i class="bi bi-save me-1"></i>儲存搶購模組設定
+                  <i class="bi bi-save me-1"></i>儲存搶購與帳號設定
                 </button>
               </div>
 
@@ -1537,6 +1587,20 @@ async function loadAutobuyConfig() {
     }
     togglePaymentInputs();
 
+    // 填入帳號登入資訊
+    const accEmail = (cfg.account_email || "").trim();
+    document.getElementById("cfgAccountEmail").value = accEmail;
+    const accBadge = document.getElementById("accountStatusBadge");
+    if (accEmail) {
+      accBadge.innerText = "已綁定 ✅";
+      accBadge.className = "badge bg-success";
+      document.getElementById("cfgAccountPassword").placeholder = "•••••••• (已保存，若不變更請留空)";
+    } else {
+      accBadge.innerText = "未綁定";
+      accBadge.className = "badge bg-secondary";
+      document.getElementById("cfgAccountPassword").placeholder = "••••••••";
+    }
+
     // 填入信用卡遮罩資訊
     const cardBadge = document.getElementById("cardStatusBadge");
     if (card.has_card_number) {
@@ -1558,7 +1622,7 @@ async function loadAutobuyConfig() {
     if (data.has_cookies) {
       cookieText.innerText = "✅ 本地已載入 " + data.cookie_count + " 個 Cookie 憑證！";
     } else {
-      cookieText.innerText = "ℹ️ 尚未匯入 Cookie，若補貨將降級為手動一鍵搶購。";
+      cookieText.innerText = "ℹ️ 尚未匯入 Cookie，若補貨將使用帳號密碼自動登入加車。";
     }
   } catch (e) {
     console.error("載入搶購設定失敗", e);
@@ -1571,6 +1635,8 @@ async function saveAutobuyConfig() {
     auto_checkout: document.getElementById("cfgAutoCheckout").checked,
     auto_submit_payment: document.getElementById("cfgAutoSubmitPayment").checked,
     payment_method: document.getElementById("cfgPaymentMethod").value,
+    account_email: document.getElementById("cfgAccountEmail").value.trim(),
+    account_password: document.getElementById("cfgAccountPassword").value.trim(),
     card_number: document.getElementById("cfgCardNumber").value.trim(),
     card_exp_month: document.getElementById("cfgCardExpMonth").value.trim(),
     card_exp_year: document.getElementById("cfgCardExpYear").value.trim(),
@@ -1585,8 +1651,9 @@ async function saveAutobuyConfig() {
       body: JSON.stringify(payload)
     });
     if (res.ok) {
-      alert("✅ 自動加車、付款與搶購模組設定已更新！");
+      alert("✅ 電商會員帳密、付款與搶購模組設定已成功保存！");
       document.getElementById("cfgCookiesJson").value = "";
+      document.getElementById("cfgAccountPassword").value = "";
       loadAutobuyConfig();
     } else {
       const err = await res.json();
@@ -1595,6 +1662,17 @@ async function saveAutobuyConfig() {
   } catch (e) {
     alert("❌ 儲存失敗: " + e);
   }
+}
+
+async function testAccountLoginUI() {
+  const email = document.getElementById("cfgAccountEmail").value.trim();
+  if (!email) {
+    alert("請先輸入您的電商會員 Email / 帳號！");
+    return;
+  }
+  alert("🔑 已啟動擬真瀏覽器自動登入測試，請於彈出的試跑視窗中觀察登入日誌！");
+  openTestModal();
+  startAutobuyTest();
 }
 
 // ======================== 測試試跑與 AI 除錯 ========================
@@ -1757,12 +1835,16 @@ function renderProducts(items) {
       : '<span class="badge badge-out-of-stock px-3 py-2"><i class="bi bi-x-circle-fill me-1"></i>缺貨中</span>';
 
     const optBadge = it.preferred_option ? `<span class="badge bg-info text-dark ms-2"><i class="bi bi-tag-fill me-1"></i>規格: ${it.preferred_option}</span>` : '';
+    const priceBadge = it.current_price ? `<span class="badge bg-warning text-dark ms-2 fs-6"><i class="bi bi-currency-dollar me-0"></i>${it.current_price}</span>` : '';
 
     html += `
       <div class="card product-card p-3">
         <div class="card-body p-2">
           <div class="d-flex justify-content-between align-items-start mb-2">
-            <h6 class="fw-bold mb-1 text-truncate" style="max-width: 75%;">${it.name || "未命名商品"} ${optBadge}</h6>
+            <div>
+              <h6 class="fw-bold mb-1 text-truncate d-inline-block" style="max-width: 550px;">${it.name || "未命名商品"} ${optBadge}</h6>
+              ${priceBadge}
+            </div>
             ${badge}
           </div>
           <div class="small text-muted mb-2"><i class="bi bi-info-circle me-1"></i>狀態詳情：${it.status_notes || "無"}</div>
@@ -1775,6 +1857,7 @@ function renderProducts(items) {
               <button class="btn btn-outline-secondary btn-sm" onclick="refreshSingle('${it.id}')">
                 <i class="bi bi-arrow-repeat me-1"></i>立即重新檢查
               </button>
+              ${it.price_history && it.price_history.length > 1 ? `<button class="btn btn-outline-info btn-sm text-dark" onclick="showPriceHistory('${encodeURIComponent(JSON.stringify(it))}')"><i class="bi bi-graph-up me-1"></i>價格趨勢</button>` : ''}
             </div>
             <button class="btn btn-outline-danger btn-sm" onclick="deleteProduct('${it.id}')">
               <i class="bi bi-trash3 me-1"></i>移除
@@ -1897,6 +1980,25 @@ async function refreshSingle(id) {
     fetchAll();
   } catch (e) {
     alert("檢查失敗: " + e);
+  }
+}
+
+function showPriceHistory(itemJsonEncoded) {
+  try {
+    const item = JSON.parse(decodeURIComponent(itemJsonEncoded));
+    const history = item.price_history || [];
+    if (history.length === 0) {
+      alert("此商品目前尚未記錄到價格波動。");
+      return;
+    }
+    let msg = `📈【${item.name}】歷史價格變動趨勢：\n\n`;
+    history.forEach(h => {
+      const stock = h.in_stock ? "🟢 有現貨" : "🔴 缺貨";
+      msg += `🕒 ${h.time} ➔ 價格: ${h.price || "未標示"} (${stock})\n`;
+    });
+    alert(msg);
+  } catch (err) {
+    alert("解析價格歷史失敗: " + err);
   }
 }
 

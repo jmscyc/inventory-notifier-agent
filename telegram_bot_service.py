@@ -276,28 +276,79 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
         ]
         await send_msg(client, chat_id, status_reply, kb)
 
-    # 5. 貼網址直接新增
+    # 5. 貼網址直接新增商品 (支援指定規格，如: https://... L號)
     else:
-        url_match = re.search(r"https?://[^\s]+costco\.com[^\s]+", text)
+        url_match = re.search(r"https?://[^\s]+", text)
         if url_match:
-            new_url = url_match.group(0)
+            new_url = url_match.group(0).strip()
+            # 擷取網址後方的指定規格文字 (例如: L號、黑色)
+            remaining_text = text.replace(new_url, "").strip()
+            pref_opt = remaining_text if remaining_text else ""
+
             code_match = re.search(r"/p/(\d+)", new_url)
-            p_code = code_match.group(1) if code_match else str(int(time.time()))
-            if not any(p.get("url") == new_url for p in products):
-                products.append({
-                    "id": p_code,
-                    "name": f"Costco 商品 ({p_code})",
-                    "url": new_url,
-                    "enabled": True,
-                    "last_status": "新加入待巡檢",
-                    "last_checked": datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
-                })
+            p_code = code_match.group(1) if code_match else f"item-{abs(hash(new_url)) % 1000000}"
+
+            # 即時爬取確認商品現況
+            await send_msg(client, chat_id, f"🔍 正在解析並抓取商品資訊中，請稍候...\n`{new_url}`")
+            crawl_res = await asyncio.to_thread(check_product_inventory, new_url)
+            p_title = crawl_res.get("title") or f"電商商品 ({p_code})"
+            in_stock = crawl_res.get("in_stock", False)
+            status_desc = crawl_res.get("status_description", "待巡檢")
+            st_icon = "🟢 現貨充足" if in_stock else "🔴 缺貨中"
+
+            matched_idx = -1
+            for i, p in enumerate(products):
+                if p.get("url") == new_url or p.get("target_url") == new_url or str(p.get("id")) == str(p_code):
+                    matched_idx = i
+                    break
+
+            now_str = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            p_data = {
+                "id": p_code,
+                "name": p_title,
+                "url": new_url,
+                "target_url": new_url,
+                "enabled": True,
+                "in_stock": in_stock,
+                "last_status": status_desc,
+                "status_notes": status_desc,
+                "last_checked": now_str,
+                "preferred_option": pref_opt
+            }
+
+            if matched_idx >= 0:
+                products[matched_idx] = p_data
                 save_data(settings, products)
-                await send_msg(client, chat_id, f"✅ 已成功將商品 `{p_code}` 加入監控清單！")
+                msg = (
+                    f"🔄 **【商品資訊與規格已更新】**\n\n"
+                    f"📦 **商品**：{p_title}\n"
+                    f"🏷️ **指定規格**：`{pref_opt or '無 (預設)'}`\n"
+                    f"📊 **目前狀態**：{st_icon} (`{status_desc}`)\n\n"
+                    f"已為您同步更新監控設定！"
+                )
             else:
-                await send_msg(client, chat_id, f"ℹ️ 該商品網址已在監控清單中！")
+                products.append(p_data)
+                save_data(settings, products)
+                msg = (
+                    f"🎉 **【已成功加入自動監控清單！】**\n\n"
+                    f"📦 **商品**：{p_title}\n"
+                    f"🏷️ **指定規格**：`{pref_opt or '無 (預設)'}`\n"
+                    f"📊 **目前狀態**：{st_icon} (`{status_desc}`)\n\n"
+                    f"⚡ 系統正每 `{settings.get('poll_interval_minutes', 5)} 分鐘` 自動巡檢，有現貨時將第一時間推播通知！"
+                )
+
+            kb = []
+            if in_stock:
+                kb.append([
+                    {"text": "🛒 前往購買賣場", "url": new_url},
+                    {"text": "⚡ 立即遠端代搶 (加車)", "callback_data": f"buy_{p_code}"}
+                ])
+            else:
+                kb.append([{"text": "🛒 前往商品賣場", "url": new_url}])
+
+            await send_msg(client, chat_id, msg, kb if kb else None)
         else:
-            await send_msg(client, chat_id, "🎛️ **請點選下方常駐按鈕進行操作**：\n\n💡 想新增商品？直接在此貼上好市多商品網址即可！")
+            await send_msg(client, chat_id, "🎛️ **請點選下方常駐按鈕進行操作**：\n\n💡 想新增商品？直接在此貼上電商商品網址（如需指定尺寸可在網址後空格輸入，例如：`https://... L號`）！")
 
 async def main():
     print("🤖 Telegram 常駐實體鍵盤監聽服務已啟動...")
