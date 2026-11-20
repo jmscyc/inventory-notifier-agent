@@ -179,7 +179,7 @@ async def handle_callback(client: httpx.AsyncClient, cb: dict):
 
             await send_msg(client, from_chat_id, f"⚡ **【收到遠端搶購指令】**\n正在調用本機自動加車引擎處理 `{p_name}`...")
             try:
-                from app.autobuy_module import execute_autobuy_flow
+                from run_local_app import execute_autobuy_flow
                 res = await execute_autobuy_flow(p_url, p_name, is_test_run=False, preferred_option=p_option)
                 st_title = res.get("status_title", "搶購完成")
                 st_msg = res.get("status_message", "")
