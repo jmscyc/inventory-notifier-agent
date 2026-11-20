@@ -504,6 +504,8 @@ async def scheduled_tasks_worker():
 
 
 async def background_scheduler():
+    from app.wakelock_module import wakelock_manager
+    consecutive_network_errors = 0
     async with httpx.AsyncClient(timeout=30.0) as client:
         while True:
             is_on = APP_CONFIG.get("is_scheduler_running", True)
@@ -511,10 +513,14 @@ async def background_scheduler():
             interval_min = APP_CONFIG.get("poll_interval_minutes", 5)
 
             if not is_on:
+                wakelock_manager.release()
                 SCHEDULER_STATUS["last_check_result"] = "監控排程已暫停 (OFF)"
                 SCHEDULER_STATUS["next_check_seconds"] = 0
                 await asyncio.sleep(2)
                 continue
+
+            # 確保防休眠鎖定中 (保持電腦在背景不進入睡眠)
+            wakelock_manager.acquire()
 
             # 開始執行巡檢
             now = datetime.datetime.now(TAIPEI_TZ)
@@ -546,9 +552,18 @@ async def background_scheduler():
                     SCHEDULER_STATUS["last_check_result"] = "檢查完成：目前尚無追蹤商品"
                 else:
                     SCHEDULER_STATUS["last_check_result"] = f"共檢查 {len(refreshed_items)} 件商品 (現貨: {in_stock_count} 件 / 缺貨: {oos_count} 件)"
+                
+                # 若之前有網路異常且成功恢復
+                if consecutive_network_errors > 0:
+                    consecutive_network_errors = 0
+                    print("🌐 [Self-Healing] 網路已自動恢復，排程持續正常運作中！")
             except Exception as e:
-                SCHEDULER_STATUS["last_check_result"] = f"巡檢發生異常: {str(e)}"
-                print(f"排程迴圈例外: {e}")
+                consecutive_network_errors += 1
+                SCHEDULER_STATUS["last_check_result"] = f"巡檢連線異常 (重試第 {consecutive_network_errors} 次): {str(e)}"
+                print(f"⚠️ [Self-Healing] 排程巡檢異常 (第 {consecutive_network_errors} 次): {e}")
+                # 指數退避延遲保護
+                backoff_wait = min(consecutive_network_errors * 5, 60)
+                await asyncio.sleep(backoff_wait)
 
             # 倒數計時器 (加入 ±10% 隨機防爬 Jitter)
             from app.autobuy_module import get_jitter_seconds
@@ -1066,12 +1081,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- 最近一次檢查時間與 Cookie 健康指標 -->
+        <!-- 最近一次檢查時間、Cookie 與防休眠狀態 -->
         <div class="col-md-4">
           <div class="d-flex justify-content-between align-items-center">
             <div class="text-muted small"><i class="bi bi-clock-history me-1"></i>最近檢查：<span class="fw-bold text-dark" id="lastCheckTimeText">尚未執行</span></div>
-            <div id="cookieHealthBadge" class="badge bg-secondary cursor-pointer" onclick="checkCookieHealthUI()" title="點擊檢驗憑證健康度">
-              🍪 檢查 Cookie
+            <div class="d-flex gap-1">
+              <span id="wakeLockBadge" class="badge bg-success" title="防系統休眠已鎖定：掛機不中斷"><i class="bi bi-cup-hot-fill me-1"></i>防休眠中</span>
+              <div id="cookieHealthBadge" class="badge bg-secondary cursor-pointer" onclick="checkCookieHealthUI()" title="點擊檢驗憑證健康度">
+                🍪 檢查 Cookie
+              </div>
             </div>
           </div>
           <div class="mt-1 text-truncate" style="font-size: 0.85rem;">
@@ -2275,6 +2293,24 @@ async function fetchSchedulerStatus() {
     document.getElementById("lastCheckTimeText").innerText = data.last_check_time || "尚未執行";
     document.getElementById("lastCheckResultText").innerText = data.last_check_result || "尚未執行";
     document.getElementById("lastNotifyTimeText").innerText = data.last_notify_time || "尚未觸發通知";
+
+    // 瀏覽器 Screen WakeLock 整合
+    const wlBadge = document.getElementById("wakeLockBadge");
+    if (data.is_running) {
+      wlBadge.className = "badge bg-success";
+      wlBadge.innerHTML = '<i class="bi bi-cup-hot-fill me-1"></i>防休眠中';
+      if ('wakeLock' in navigator && !window.browserWakeLock) {
+        navigator.wakeLock.request('screen').then(lock => {
+          window.browserWakeLock = lock;
+        }).catch(() => {});
+      }
+    } else {
+      wlBadge.className = "badge bg-secondary";
+      wlBadge.innerHTML = '<i class="bi bi-moon me-1"></i>節能中';
+      if (window.browserWakeLock) {
+        window.browserWakeLock.release().then(() => { window.browserWakeLock = null; }).catch(() => {});
+      }
+    }
 
     updateCountdownDisplay();
   } catch (e) {

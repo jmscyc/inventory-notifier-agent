@@ -276,13 +276,40 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
         ]
         await send_msg(client, chat_id, status_reply, kb)
 
-    # 5. 貼網址直接新增商品 (支援指定規格，如: https://... L號)
+    # 指令：設定目標預算價 /setprice [ID] [金額] (例如: /setprice 12345 1500)
+    elif text.startswith("/setprice") or text.startswith("設定價格"):
+        parts = text.split()
+        if len(parts) >= 3:
+            t_id = parts[1].strip()
+            target_p = re.sub(r"[^\d.]", "", parts[2].strip())
+            matched = False
+            for p in products:
+                if str(p.get("id")) == t_id or t_id in str(p.get("url")):
+                    p["target_price"] = float(target_p) if target_p else None
+                    matched = True
+                    save_data(settings, products)
+                    await send_msg(client, chat_id, f"🎯 **【已設定心理預算價格】**\n\n商品：{p.get('name')}\n目標預算上限：`${target_p}` 元\n（當有現貨且價格 ≤ 此金額時才會觸發推播或自動代搶）")
+                    break
+            if not matched:
+                await send_msg(client, chat_id, f"⚠️ 找不到編號為 `{t_id}` 的商品，請確認清單中的編號。")
+        else:
+            await send_msg(client, chat_id, "ℹ️ 請使用格式：`/setprice [商品編號] [目標金額]`\n例如：`/setprice 123456 1200`")
+
+    # 5. 貼網址直接新增商品 (支援指定規格與預算，如: https://... L號 1200)
     else:
         url_match = re.search(r"https?://[^\s]+", text)
         if url_match:
             new_url = url_match.group(0).strip()
-            # 擷取網址後方的指定規格文字 (例如: L號、黑色)
+            # 擷取網址後方的額外參數 (例如: L號 1500 或 黑色)
             remaining_text = text.replace(new_url, "").strip()
+            
+            # 嘗試解析是否有純數字作為預算金額
+            budget_price = None
+            price_match = re.search(r"\b(\d{2,6})\b", remaining_text)
+            if price_match:
+                budget_price = float(price_match.group(1))
+                remaining_text = remaining_text.replace(price_match.group(0), "").strip()
+
             pref_opt = remaining_text if remaining_text else ""
 
             code_match = re.search(r"/p/(\d+)", new_url)
@@ -295,6 +322,7 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
             in_stock = crawl_res.get("in_stock", False)
             status_desc = crawl_res.get("status_description", "待巡檢")
             st_icon = "🟢 現貨充足" if in_stock else "🔴 缺貨中"
+            curr_price = crawl_res.get("price", "")
 
             matched_idx = -1
             for i, p in enumerate(products):
@@ -313,8 +341,13 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
                 "last_status": status_desc,
                 "status_notes": status_desc,
                 "last_checked": now_str,
-                "preferred_option": pref_opt
+                "preferred_option": pref_opt,
+                "current_price": curr_price,
+                "target_price": budget_price
             }
+
+            budget_info = f"\n💰 **目標預算上限**：`${budget_price}` 元" if budget_price else ""
+            price_info = f"\n💵 **當前抓取售價**：`{curr_price}`" if curr_price else ""
 
             if matched_idx >= 0:
                 products[matched_idx] = p_data
@@ -322,7 +355,7 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
                 msg = (
                     f"🔄 **【商品資訊與規格已更新】**\n\n"
                     f"📦 **商品**：{p_title}\n"
-                    f"🏷️ **指定規格**：`{pref_opt or '無 (預設)'}`\n"
+                    f"🏷️ **指定規格**：`{pref_opt or '無 (預設)'}`{price_info}{budget_info}\n"
                     f"📊 **目前狀態**：{st_icon} (`{status_desc}`)\n\n"
                     f"已為您同步更新監控設定！"
                 )
@@ -332,7 +365,7 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
                 msg = (
                     f"🎉 **【已成功加入自動監控清單！】**\n\n"
                     f"📦 **商品**：{p_title}\n"
-                    f"🏷️ **指定規格**：`{pref_opt or '無 (預設)'}`\n"
+                    f"🏷️ **指定規格**：`{pref_opt or '無 (預設)'}`{price_info}{budget_info}\n"
                     f"📊 **目前狀態**：{st_icon} (`{status_desc}`)\n\n"
                     f"⚡ 系統正每 `{settings.get('poll_interval_minutes', 5)} 分鐘` 自動巡檢，有現貨時將第一時間推播通知！"
                 )
