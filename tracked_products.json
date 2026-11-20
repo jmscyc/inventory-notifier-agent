@@ -1,5 +1,5 @@
 {
-  "_說明": "【好市多智慧監控設定檔】直接在此修改週期與商品，GitHub 雲端每 15 分鐘全自動巡檢！",
+  "_說明": "【好市多智慧監控設定檔】直接在此修改或透過 Telegram 隨時調整！",
   "settings": {
     "is_active": true,
     "quiet_hours_enabled": true,
@@ -18,7 +18,8 @@
       "url": "https://www.costco.com.tw/p/142997",
       "enabled": true,
       "last_status": "🔴 缺貨 (未發現加入購物車按鈕)",
-      "last_checked": "2026-11-20 19:12:25"
+      "last_checked": "2026-11-20 19:14:35"
     }
-  ]
+  ],
+  "scheduled_tasks": []
 }
