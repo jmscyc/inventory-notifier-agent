@@ -97,8 +97,19 @@ def save_config(cfg: dict):
         print(f"⚠️ 儲存設定失敗: {e}")
 
 APP_CONFIG = load_config()
+if "is_scheduler_running" not in APP_CONFIG:
+    APP_CONFIG["is_scheduler_running"] = True
+
 NOTIFY_STATE = {}
 RECENT_LOCAL_NOTIFICATIONS = []
+SCHEDULER_STATUS = {
+    "is_running": APP_CONFIG.get("is_scheduler_running", True),
+    "last_check_time": "",
+    "last_check_result": "系統初始化完成，等待第一次巡檢",
+    "last_notify_time": "",
+    "next_check_seconds": 0,
+    "next_notify_seconds": 0,
+}
 
 def load_tracked_items() -> list:
     if not DATA_FILE.exists():
@@ -293,6 +304,7 @@ async def broadcast_notification(client: Optional[httpx.AsyncClient], title: str
         RECENT_LOCAL_NOTIFICATIONS.append(event)
         if len(RECENT_LOCAL_NOTIFICATIONS) > 30:
             RECENT_LOCAL_NOTIFICATIONS.pop(0)
+    SCHEDULER_STATUS["last_notify_time"] = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     if APP_CONFIG.get("enable_telegram", True) and client:
         token = APP_CONFIG.get("telegram_bot_token")
@@ -439,8 +451,26 @@ async def scheduled_tasks_worker():
 async def background_scheduler():
     async with httpx.AsyncClient(timeout=30.0) as client:
         while True:
+            is_on = APP_CONFIG.get("is_scheduler_running", True)
+            SCHEDULER_STATUS["is_running"] = is_on
+            interval_min = APP_CONFIG.get("poll_interval_minutes", 5)
+
+            if not is_on:
+                SCHEDULER_STATUS["last_check_result"] = "監控排程已暫停 (OFF)"
+                SCHEDULER_STATUS["next_check_seconds"] = 0
+                await asyncio.sleep(2)
+                continue
+
+            # 開始執行巡檢
+            now = datetime.datetime.now(TAIPEI_TZ)
+            now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+            SCHEDULER_STATUS["last_check_time"] = now_str
+
+            items = load_tracked_items()
+            in_stock_count = 0
+            oos_count = 0
+
             try:
-                items = load_tracked_items()
                 for item in items:
                     if item.get("target_url"):
                         try:
@@ -448,11 +478,30 @@ async def background_scheduler():
                         except Exception as e:
                             print(f"巡檢異常 ({item.get('id')}): {e}")
                         await asyncio.sleep(2)
+                
+                # 計算本次檢查結果摘要
+                refreshed_items = load_tracked_items()
+                for it in refreshed_items:
+                    if it.get("in_stock"):
+                        in_stock_count += 1
+                    else:
+                        oos_count += 1
+
+                if len(refreshed_items) == 0:
+                    SCHEDULER_STATUS["last_check_result"] = "檢查完成：目前尚無追蹤商品"
+                else:
+                    SCHEDULER_STATUS["last_check_result"] = f"共檢查 {len(refreshed_items)} 件商品 (現貨: {in_stock_count} 件 / 缺貨: {oos_count} 件)"
             except Exception as e:
+                SCHEDULER_STATUS["last_check_result"] = f"巡檢發生異常: {str(e)}"
                 print(f"排程迴圈例外: {e}")
 
-            interval = APP_CONFIG.get("poll_interval_minutes", 5)
-            await asyncio.sleep(interval * 60)
+            # 倒數計時器
+            total_seconds = max(interval_min * 60, 10)
+            for remaining in range(total_seconds, 0, -1):
+                if not APP_CONFIG.get("is_scheduler_running", True):
+                    break
+                SCHEDULER_STATUS["next_check_seconds"] = remaining
+                await asyncio.sleep(1)
 
 
 async def telegram_bot_worker():
@@ -598,6 +647,54 @@ async def api_refresh_single(item_id: str):
         await perform_check_and_notify_single(client, matched[0], is_manual=True)
     return {"success": True}
 
+@app.get("/api/scheduler/status")
+def api_get_scheduler_status():
+    is_on = APP_CONFIG.get("is_scheduler_running", True)
+    oos_hours = APP_CONFIG.get("oos_notify_hours", 4)
+    
+    # 計算下一次主動通知還有多久 (以追蹤中的缺貨商品為基準)
+    next_notify_seconds = None
+    if is_on and oos_hours > 0:
+        now_ts = time.time()
+        # 尋找最快需要通報缺貨的商品
+        min_rem = None
+        for it_id, st in NOTIFY_STATE.items():
+            if st.get("last_notified_stock") is False:
+                last_time = st.get("last_notified_time", 0)
+                target_notify_ts = last_time + (oos_hours * 3600)
+                rem = max(0, int(target_notify_ts - now_ts))
+                if min_rem is None or rem < min_rem:
+                    min_rem = rem
+        if min_rem is not None:
+            next_notify_seconds = min_rem
+        else:
+            # 尚未有進入缺貨週期的通知，預設為下一次週期
+            next_notify_seconds = oos_hours * 3600
+    elif oos_hours == 0:
+        next_notify_seconds = -1 # 代表僅補貨時通知
+
+    return {
+        "is_running": is_on,
+        "poll_interval_minutes": APP_CONFIG.get("poll_interval_minutes", 5),
+        "oos_notify_hours": oos_hours,
+        "last_check_time": SCHEDULER_STATUS.get("last_check_time") or "尚未執行",
+        "last_check_result": SCHEDULER_STATUS.get("last_check_result") or "尚未執行",
+        "last_notify_time": SCHEDULER_STATUS.get("last_notify_time") or "尚未觸發通知",
+        "next_check_seconds": SCHEDULER_STATUS.get("next_check_seconds", 0),
+        "next_notify_seconds": next_notify_seconds
+    }
+
+@app.post("/api/scheduler/toggle")
+def api_toggle_scheduler():
+    current = APP_CONFIG.get("is_scheduler_running", True)
+    APP_CONFIG["is_scheduler_running"] = not current
+    save_config(APP_CONFIG)
+    SCHEDULER_STATUS["is_running"] = APP_CONFIG["is_scheduler_running"]
+    if not APP_CONFIG["is_scheduler_running"]:
+        SCHEDULER_STATUS["next_check_seconds"] = 0
+        SCHEDULER_STATUS["last_check_result"] = "監控排程已暫停 (OFF)"
+    return {"success": True, "is_running": APP_CONFIG["is_scheduler_running"]}
+
 @app.get("/api/config")
 def api_get_config():
     return APP_CONFIG
@@ -742,6 +839,59 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <button class="btn btn-light btn-sm text-primary fw-bold" onclick="fetchAll(true)">
         <i class="bi bi-arrow-clockwise me-1"></i>全部重新爬蟲
       </button>
+    </div>
+  </div>
+
+  <!-- ⏱️ 即時排程與巡檢狀態儀表板 -->
+  <div class="card shadow-sm border-0 mb-4 rounded-3" style="background: white;">
+    <div class="card-body p-3 p-md-4">
+      <div class="row g-3 align-items-center">
+        <!-- 狀態開關 -->
+        <div class="col-md-3 border-end-md">
+          <div class="d-flex align-items-center gap-3">
+            <div id="schedulerStatusBadge" class="rounded-circle p-3 d-flex align-items-center justify-content-center bg-success-subtle text-success" style="width: 55px; height: 55px;">
+              <i class="bi bi-broadcast fs-3" id="schedulerIcon"></i>
+            </div>
+            <div>
+              <div class="text-muted small fw-bold">背景巡檢排程狀態</div>
+              <div class="d-flex align-items-center gap-2 mt-1">
+                <span class="badge bg-success fs-6 px-3 py-1" id="schedulerStateText">運作中 (ON)</span>
+                <button class="btn btn-sm btn-outline-secondary" id="toggleSchedulerBtn" onclick="toggleScheduler()">
+                  暫停監控
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 倒數計時與下一次預估 -->
+        <div class="col-md-5 border-end-md">
+          <div class="row g-2">
+            <div class="col-6">
+              <div class="text-muted small"><i class="bi bi-hourglass-split text-primary me-1"></i>下一次檢查倒數</div>
+              <h5 class="fw-bold text-primary mb-0 mt-1" id="nextCheckCountdown">--:--</h5>
+              <div class="text-muted" style="font-size: 0.75rem;" id="pollCycleHint">週期: 5 分鐘</div>
+            </div>
+            <div class="col-6">
+              <div class="text-muted small"><i class="bi bi-bell text-warning me-1"></i>下一次主動通知</div>
+              <h5 class="fw-bold text-dark mb-0 mt-1" id="nextNotifyCountdown">--:--</h5>
+              <div class="text-muted" style="font-size: 0.75rem;" id="oosCycleHint">缺貨通知: 4 小時/次</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 最近一次檢查時間與結果 -->
+        <div class="col-md-4">
+          <div class="text-muted small"><i class="bi bi-clock-history me-1"></i>最近檢查時間：<span class="fw-bold text-dark" id="lastCheckTimeText">尚未執行</span></div>
+          <div class="mt-1 text-truncate" style="font-size: 0.85rem;">
+            <span class="badge bg-light text-dark border me-1">結果</span>
+            <span id="lastCheckResultText" class="text-muted">系統就緒中...</span>
+          </div>
+          <div class="mt-1 text-muted" style="font-size: 0.75rem;">
+            <i class="bi bi-send-check me-1"></i>最近推播：<span id="lastNotifyTimeText">尚未觸發通知</span>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1452,6 +1602,110 @@ async function pollLocalNotifications() {
   setTimeout(pollLocalNotifications, 3000);
 }
 
+// ======================== 巡檢即時狀態與倒數計時 ========================
+let schedulerTimerSeconds = 0;
+let schedulerNotifySeconds = null;
+let isSchedulerActive = true;
+
+function formatCountdown(sec) {
+  if (sec === null || sec === undefined) return "--:--";
+  if (sec < 0) return "僅補貨時通知";
+  if (sec === 0) return "正在檢查中...";
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    const remM = m % 60;
+    return h + " 小時 " + remM + " 分";
+  }
+  return (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s);
+}
+
+async function fetchSchedulerStatus() {
+  try {
+    const res = await fetch("/api/scheduler/status");
+    if (!res.ok) return;
+    const data = await res.json();
+    isSchedulerActive = data.is_running;
+
+    // 更新 ON / OFF 狀態
+    const badge = document.getElementById("schedulerStateText");
+    const iconBox = document.getElementById("schedulerStatusBadge");
+    const toggleBtn = document.getElementById("toggleSchedulerBtn");
+    if (isSchedulerActive) {
+      badge.className = "badge bg-success fs-6 px-3 py-1";
+      badge.innerText = "運作中 (ON)";
+      iconBox.className = "rounded-circle p-3 d-flex align-items-center justify-content-center bg-success-subtle text-success";
+      toggleBtn.className = "btn btn-sm btn-outline-danger";
+      toggleBtn.innerText = "暫停監控";
+    } else {
+      badge.className = "badge bg-secondary fs-6 px-3 py-1";
+      badge.innerText = "已暫停 (OFF)";
+      iconBox.className = "rounded-circle p-3 d-flex align-items-center justify-content-center bg-secondary-subtle text-secondary";
+      toggleBtn.className = "btn btn-sm btn-outline-success";
+      toggleBtn.innerText = "啟動監控";
+    }
+
+    schedulerTimerSeconds = data.next_check_seconds;
+    schedulerNotifySeconds = data.next_notify_seconds;
+
+    document.getElementById("pollCycleHint").innerText = "週期: 每 " + data.poll_interval_minutes + " 分鐘";
+    document.getElementById("oosCycleHint").innerText = data.oos_notify_hours > 0 ? ("缺貨回報: 每 " + data.oos_notify_hours + " 小時") : "缺貨回報: 僅補貨通知";
+
+    document.getElementById("lastCheckTimeText").innerText = data.last_check_time || "尚未執行";
+    document.getElementById("lastCheckResultText").innerText = data.last_check_result || "尚未執行";
+    document.getElementById("lastNotifyTimeText").innerText = data.last_notify_time || "尚未觸發通知";
+
+    updateCountdownDisplay();
+  } catch (e) {
+    console.error("讀取排程狀態失敗", e);
+  }
+}
+
+function updateCountdownDisplay() {
+  const checkElem = document.getElementById("nextCheckCountdown");
+  const notifyElem = document.getElementById("nextNotifyCountdown");
+
+  if (!isSchedulerActive) {
+    checkElem.innerText = "已暫停";
+    checkElem.className = "fw-bold text-muted mb-0 mt-1";
+    notifyElem.innerText = "已暫停";
+    notifyElem.className = "fw-bold text-muted mb-0 mt-1";
+    return;
+  }
+
+  checkElem.className = "fw-bold text-primary mb-0 mt-1";
+  checkElem.innerText = formatCountdown(schedulerTimerSeconds);
+
+  notifyElem.className = "fw-bold text-dark mb-0 mt-1";
+  notifyElem.innerText = formatCountdown(schedulerNotifySeconds);
+}
+
+// 每秒本地平滑倒數
+setInterval(() => {
+  if (isSchedulerActive && schedulerTimerSeconds > 0) {
+    schedulerTimerSeconds--;
+    if (schedulerNotifySeconds && schedulerNotifySeconds > 0) {
+      schedulerNotifySeconds--;
+    }
+    updateCountdownDisplay();
+  }
+}, 1000);
+
+// 每 3 秒同步一次後端真實排程數據
+setInterval(fetchSchedulerStatus, 3000);
+
+async function toggleScheduler() {
+  try {
+    const res = await fetch("/api/scheduler/toggle", { method: "POST" });
+    if (res.ok) {
+      await fetchSchedulerStatus();
+    }
+  } catch (e) {
+    alert("切換狀態失敗: " + e);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   if ("Notification" in window) {
     updateNotifButton(Notification.permission);
@@ -1461,6 +1715,7 @@ window.addEventListener("DOMContentLoaded", () => {
   fetchAll();
   loadScheduledTasks();
   loadCustomRules();
+  fetchSchedulerStatus();
   pollLocalNotifications();
 });
 </script>
