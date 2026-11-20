@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-【本地全功能整合版 - Web 控制台 + 自動加車/自動結帳 + 桌面推播 + Telegram 雙軌庫存監控系統】
+【本地全功能整合旗艦版 - Web 控制台 + 預約定時搶登入 + 互動式視覺化爬蟲 + 桌面/Telegram 雙軌通知】
 
-功能特點：
-1. 階梯式自動加車與自動結帳 (Auto-Cart & Auto-Checkout):
-   - 第一階段：補貨時自動以 Cookie / 帳號加入購物車，推播「已為您自動放入購物車！請在 15 分鐘內點此完成結帳」
-   - 第二階段：支援一鍵直達結帳確認頁面，或自動推進至付款確認頁
-   - 容錯保護：每一段失敗至少保留前段正常執行，並提供即時推播通知
-2. 現代化 Web UI 控制台 (http://localhost:8000)
-3. 支援 HTML5 桌面推播通知與 Telegram 雙軌通知
-4. 單一檔案直接在本地端執行，零雲端依賴！
+亮點功能：
+1. 階梯式自動加車與自動結帳 (Auto-Cart & Auto-Checkout)
+2. 預約定時執行 (Scheduled Auto-Login / Auto-Trigger)：精準秒級倒數或立即執行
+3. 小白友善的「互動式視覺爬蟲抓取精靈」：
+   - 附帶圖文並茂的 F12 瀏覽器抓取教學
+   - 支援即時「測試抓取」確認目標元素
+4. 現代化 Web UI 控制台 (http://localhost:8000)
+5. 支援 HTML5 桌面推播通知與 Telegram 雙向通報
 """
 
 import asyncio
@@ -21,7 +21,7 @@ import sys
 import time
 import zoneinfo
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import httpx
 from bs4 import BeautifulSoup
@@ -37,6 +37,19 @@ from app.autobuy_module import (
     load_saved_cookies,
     save_cookies,
 )
+from app.scheduled_tasks_module import (
+    load_scheduled_tasks,
+    save_scheduled_tasks,
+    add_scheduled_task,
+    delete_scheduled_task,
+)
+from app.custom_crawler_module import (
+    load_custom_rules,
+    save_custom_rules,
+    add_custom_rule,
+    delete_custom_rule,
+    test_crawl_url,
+)
 
 load_dotenv()
 
@@ -45,7 +58,7 @@ CONFIG_FILE = Path(__file__).parent / "app_config.json"
 TAIPEI_TZ = zoneinfo.ZoneInfo("Asia/Taipei")
 
 # =====================================================================
-# 1. 組態設定與本地資料庫持久化
+# 1. 組態設定與本地資料持久化
 # =====================================================================
 
 DEFAULT_CONFIG = {
@@ -144,7 +157,7 @@ def delete_item(item_id: str) -> bool:
 
 
 # =====================================================================
-# 2. 核心爬蟲檢測模組 (精準判定 Costco / 一般電商)
+# 2. 爬蟲檢測模組 (支援通用電商與自訂規則)
 # =====================================================================
 
 def check_product_inventory(url: str) -> dict:
@@ -256,15 +269,14 @@ def check_product_inventory(url: str) -> dict:
 
 
 # =====================================================================
-# 3. 雙向通知發送器 (本機推播佇列 + Telegram)
+# 3. 雙向通知發送器 (本機推播 + Telegram)
 # =====================================================================
 
 def is_quiet_hours() -> bool:
     now_taipei = datetime.datetime.now(TAIPEI_TZ)
     return 1 <= now_taipei.hour < 5
 
-async def broadcast_notification(client: Optional[httpx.AsyncClient], title: str, body: str, target_url: str = "", button_text: str = "🛒 前往商品頁面"):
-    # 1. 登記到本機推播佇列
+async def broadcast_notification(client: Optional[httpx.AsyncClient], title: str, body: str, target_url: str = "", button_text: str = "🛒 前往目標頁面"):
     if APP_CONFIG.get("enable_local_notification", True):
         event = {
             "id": f"notif_{int(time.time() * 1000)}",
@@ -277,7 +289,6 @@ async def broadcast_notification(client: Optional[httpx.AsyncClient], title: str
         if len(RECENT_LOCAL_NOTIFICATIONS) > 30:
             RECENT_LOCAL_NOTIFICATIONS.pop(0)
 
-    # 2. 發送 Telegram 通知
     if APP_CONFIG.get("enable_telegram", True) and client:
         token = APP_CONFIG.get("telegram_bot_token")
         chat_id = APP_CONFIG.get("telegram_chat_id")
@@ -330,7 +341,6 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
     if is_manual:
         should_send = True
         if in_stock:
-            # 觸發搶購流水線
             flow_res = await execute_autobuy_flow(target_url, name)
             notify_title = flow_res["status_title"]
             notify_body = flow_res["status_message"]
@@ -344,7 +354,6 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
             NOTIFY_STATE[item_id] = {"last_notified_stock": last_notified_stock, "last_notified_time": last_notified_time}
             return
 
-        # 補貨上架：缺貨 -> 有貨 (觸發階梯式自動加車與結帳流水線！)
         if in_stock and (last_notified_stock is not True):
             should_send = True
             flow_res = await execute_autobuy_flow(target_url, name)
@@ -353,13 +362,11 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
             action_url = flow_res["action_url"]
             btn_text = flow_res["action_button_text"]
 
-        # 初次缺貨
         elif (not in_stock) and (last_notified_stock is None or last_notified_stock is True):
             should_send = True
             notify_title = "📢 **【商品目前缺貨提醒】**"
             notify_body = f"📦 **商品**：{name}\n🔴 **狀態**：{status_desc}\n系統正每 {poll_interval} 分鐘自動巡檢！"
 
-        # 持續缺貨例行回報
         elif (not in_stock) and (last_notified_stock is False):
             if oos_hours > 0:
                 if (now_ts - last_notified_time) >= (oos_hours * 3600):
@@ -373,11 +380,58 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
 
 
 # =====================================================================
-# 4. 背景定時巡檢排程 Task
+# 4. 背景排程 Worker (巡檢 + 預約搶登入排程)
 # =====================================================================
 
+async def scheduled_tasks_worker():
+    """定期檢查並執行時間到達的預約任務"""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            try:
+                tasks = load_scheduled_tasks()
+                now = datetime.datetime.now(TAIPEI_TZ)
+                now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+                for t in tasks:
+                    if t.get("status") == "PENDING":
+                        exec_at = t.get("execute_at", "")
+                        is_ready = False
+                        if exec_at == "IMMEDIATE":
+                            is_ready = True
+                        else:
+                            try:
+                                target_time = datetime.datetime.strptime(exec_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TAIPEI_TZ)
+                                if now >= target_time:
+                                    is_ready = True
+                            except Exception:
+                                pass
+
+                        if is_ready:
+                            t["status"] = "RUNNING"
+                            save_scheduled_tasks(tasks)
+                            print(f"🎯 觸發預約任務：{t.get('title')} -> {t.get('target_url')}")
+
+                            # 執行搶購或登入導向流程
+                            flow_res = await execute_autobuy_flow(t.get("target_url"), t.get("title"))
+                            t["status"] = "COMPLETED"
+                            t["result_message"] = flow_res["status_title"]
+                            save_scheduled_tasks(tasks)
+
+                            # 推播通知
+                            await broadcast_notification(
+                                client,
+                                f"⏰ **【預約任務觸發成功】** {t.get('title')}",
+                                f"{flow_res['status_message']}\n時間：`{now_str}`",
+                                flow_res["action_url"],
+                                flow_res["action_button_text"]
+                            )
+            except Exception as e:
+                print(f"預約任務巡檢異常: {e}")
+
+            await asyncio.sleep(2)
+
+
 async def background_scheduler():
-    print("⏰ 全功能背景庫存巡檢排程已啟動...")
     async with httpx.AsyncClient(timeout=30.0) as client:
         while True:
             try:
@@ -395,10 +449,6 @@ async def background_scheduler():
             interval = APP_CONFIG.get("poll_interval_minutes", 5)
             await asyncio.sleep(interval * 60)
 
-
-# =====================================================================
-# 5. Telegram Bot 輪詢 Task (可選開關)
-# =====================================================================
 
 async def telegram_bot_worker():
     offset = 0
@@ -446,10 +496,10 @@ async def telegram_bot_worker():
 
 
 # =====================================================================
-# 6. FastAPI Web 控制台與 API 路由
+# 5. FastAPI 路由與 API
 # =====================================================================
 
-app = FastAPI(title="商品庫存追蹤與通知控制台")
+app = FastAPI(title="商品庫存監控與智慧自動化控制台")
 
 class AddItemReq(BaseModel):
     url: str
@@ -468,10 +518,29 @@ class UpdateAutobuyReq(BaseModel):
     account_password: Optional[str] = ""
     cookies_json: Optional[str] = ""
 
+class AddScheduledTaskReq(BaseModel):
+    title: str
+    target_url: str
+    execute_at: str
+    action_type: Optional[str] = "login_and_open"
+
+class TestCrawlReq(BaseModel):
+    url: str
+    selector: Optional[str] = ""
+    match_text: Optional[str] = ""
+
+class AddCustomRuleReq(BaseModel):
+    name: str
+    target_url: str
+    selector: Optional[str] = ""
+    match_text: Optional[str] = ""
+    check_type: Optional[str] = "text_contains"
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(background_scheduler())
     asyncio.create_task(telegram_bot_worker())
+    asyncio.create_task(scheduled_tasks_worker())
 
 @app.get("/api/items")
 def api_get_items():
@@ -560,7 +629,6 @@ def api_update_autobuy(req: UpdateAutobuyReq):
         cfg["account_password"] = req.account_password.strip()
     save_autobuy_config(cfg)
 
-    # 若有貼上 Cookie JSON 則保存
     if req.cookies_json:
         try:
             parsed_cookies = json.loads(req.cookies_json)
@@ -576,6 +644,41 @@ def api_update_autobuy(req: UpdateAutobuyReq):
             return JSONResponse({"success": False, "message": f"Cookie 格式錯誤: {e}"}, status_code=400)
 
     return {"success": True, "config": cfg}
+
+# 預約任務 API
+@app.get("/api/scheduled_tasks")
+def api_get_scheduled_tasks():
+    return {"tasks": load_scheduled_tasks()}
+
+@app.post("/api/scheduled_tasks")
+def api_add_scheduled_task(req: AddScheduledTaskReq):
+    task = add_scheduled_task(req.title, req.target_url, req.execute_at, req.action_type or "login_and_open")
+    return {"success": True, "task": task}
+
+@app.delete("/api/scheduled_tasks/{task_id}")
+def api_delete_scheduled_task(task_id: str):
+    ok = delete_scheduled_task(task_id)
+    return {"success": ok}
+
+# 自訂爬蟲與測試 API
+@app.post("/api/custom_crawler/test")
+def api_test_crawl(req: TestCrawlReq):
+    res = test_crawl_url(req.url, req.selector or "", req.match_text or "")
+    return res
+
+@app.get("/api/custom_crawler/rules")
+def api_get_custom_rules():
+    return {"rules": load_custom_rules()}
+
+@app.post("/api/custom_crawler/rules")
+def api_add_custom_rule(req: AddCustomRuleReq):
+    rule = add_custom_rule(req.name, req.target_url, req.selector or "", req.match_text or "", req.check_type or "text_contains")
+    return {"success": True, "rule": rule}
+
+@app.delete("/api/custom_crawler/rules/{rule_id}")
+def api_delete_custom_rule(rule_id: str):
+    ok = delete_custom_rule(rule_id)
+    return {"success": ok}
 
 @app.get("/api/notifications/poll")
 def api_poll_notifications(since_id: Optional[str] = None):
@@ -594,7 +697,7 @@ def api_poll_notifications(since_id: Optional[str] = None):
 
 
 # =====================================================================
-# 7. 現代化 Web 前端頁面 (繁體中文 Single Page Application)
+# 6. Web 控制台介面 (含 F12 小白視覺教學 + 預約任務 + 自訂爬蟲)
 # =====================================================================
 
 HTML_DASHBOARD = """<!DOCTYPE html>
@@ -602,7 +705,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>商品庫存監控與智慧提醒控制台</title>
+  <title>智慧庫存監控、預約搶登入與視覺爬蟲工作台</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
   <style>
@@ -613,20 +716,23 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     .badge-in-stock { background-color: #198754; font-size: 0.9rem; }
     .badge-out-of-stock { background-color: #dc3545; font-size: 0.9rem; }
     .autobuy-box { background-color: #fff9e6; border: 1px solid #ffeeba; border-radius: 8px; }
+    .f12-box { background-color: #e8f4fd; border-left: 4px solid #0d6efd; border-radius: 4px; padding: 12px; }
+    .nav-tabs .nav-link { font-weight: bold; color: #495057; }
+    .nav-tabs .nav-link.active { color: #0d6efd; border-bottom: 3px solid #0d6efd; }
   </style>
 </head>
 <body class="p-3 p-md-4">
-<div class="container-fluid" style="max-width: 1100px;">
+<div class="container-fluid" style="max-width: 1200px;">
 
   <!-- 頂部 Header -->
   <div class="p-4 mb-4 header-card shadow-sm d-flex flex-wrap justify-content-between align-items-center">
     <div>
-      <h3 class="mb-1 fw-bold"><i class="bi bi-box-seam me-2"></i>商品庫存監控與自動搶購控制台</h3>
-      <p class="mb-0 text-white-50">支援好市多 Costco、PChome 等電商庫存即時偵測・自動加購物車・本機桌面推播與 Telegram 雙向通報</p>
+      <h3 class="mb-1 fw-bold"><i class="bi bi-robot me-2"></i>智慧自動化工作台：庫存監控・預約搶登入・自訂爬蟲</h3>
+      <p class="mb-0 text-white-50">支援電商現貨偵測、階梯式自動加車、毫秒級定時預約執行與小白視覺化 F12 抓取輔助</p>
     </div>
     <div class="mt-3 mt-md-0 d-flex gap-2">
       <button class="btn btn-outline-light btn-sm" onclick="requestNotificationPermission()">
-        <i class="bi bi-bell-fill me-1"></i><span id="notifBtnText">啟用瀏覽器本機通知</span>
+        <i class="bi bi-bell-fill me-1"></i><span id="notifBtnText">啟用本機推播通知</span>
       </button>
       <button class="btn btn-light btn-sm text-primary fw-bold" onclick="fetchAll(true)">
         <i class="bi bi-arrow-clockwise me-1"></i>全部重新爬蟲
@@ -634,120 +740,279 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="row g-4">
-    <!-- 左側：新增商品與清單 -->
-    <div class="col-lg-8">
-      <!-- 新增商品卡片 -->
-      <div class="card shadow-sm border-0 mb-4 rounded-3">
-        <div class="card-body p-4">
-          <h5 class="fw-bold mb-3"><i class="bi bi-plus-circle text-primary me-2"></i>新增追蹤商品</h5>
-          <div class="input-group">
-            <input type="url" id="newUrlInput" class="form-control form-control-lg" placeholder="請貼上商品完整網址 (例: https://www.costco.com.tw/.../p/123456)">
-            <button class="btn btn-primary px-4 fw-bold" id="addBtn" onclick="addProduct()">
-              <span id="addBtnSpinner" class="spinner-border spinner-border-sm d-none me-1"></span>新增追蹤
-            </button>
+  <!-- 分頁導覽列 -->
+  <ul class="nav nav-tabs mb-4" id="mainTab" role="tablist">
+    <li class="nav-item">
+      <button class="nav-link active" id="tab-inventory" data-bs-toggle="tab" data-bs-target="#pane-inventory" type="button">
+        <i class="bi bi-box-seam me-1"></i>商品庫存監控與搶購
+      </button>
+    </li>
+    <li class="nav-item">
+      <button class="nav-link" id="tab-schedule" data-bs-toggle="tab" data-bs-target="#pane-schedule" type="button">
+        <i class="bi bi-alarm me-1"></i>預約搶登入 / 定時任務
+      </button>
+    </li>
+    <li class="nav-item">
+      <button class="nav-link" id="tab-custom" data-bs-toggle="tab" data-bs-target="#pane-custom" type="button">
+        <i class="bi bi-magic me-1"></i>萬用網頁爬蟲精靈 (F12小白指引)
+      </button>
+    </li>
+  </ul>
+
+  <!-- 分頁內容 -->
+  <div class="tab-content" id="mainTabContent">
+
+    <!-- ======================= 分頁 1: 庫存監控與搶購 ======================= -->
+    <div class="tab-pane fade show active" id="pane-inventory" role="tabpanel">
+      <div class="row g-4">
+        <div class="col-lg-8">
+          <div class="card shadow-sm border-0 mb-4 rounded-3">
+            <div class="card-body p-4">
+              <h5 class="fw-bold mb-3"><i class="bi bi-plus-circle text-primary me-2"></i>新增追蹤商品</h5>
+              <div class="input-group">
+                <input type="url" id="newUrlInput" class="form-control form-control-lg" placeholder="請貼上商品完整網址 (例: https://www.costco.com.tw/.../p/123456)">
+                <button class="btn btn-primary px-4 fw-bold" id="addBtn" onclick="addProduct()">
+                  <span id="addBtnSpinner" class="spinner-border spinner-border-sm d-none me-1"></span>新增追蹤
+                </button>
+              </div>
+              <div class="form-text text-muted mt-2">支援好市多、PChome 等電商，加入前即刻至頁面檢驗是否具備現貨與數量選單。</div>
+            </div>
           </div>
-          <div class="form-text text-muted mt-2">系統將在加入前即刻至電商頁面檢驗是否具備現貨與購物車按鈕。</div>
+
+          <div class="d-flex justify-content-between align-items-center mb-3">
+            <h5 class="fw-bold mb-0"><i class="bi bi-list-task me-2"></i>追蹤清單 (<span id="itemCount">0</span>)</h5>
+            <small class="text-muted" id="lastUpdatedText"></small>
+          </div>
+          <div id="productList" class="d-flex flex-column gap-3">
+            <div class="text-center py-5 text-muted">正在載入商品清單...</div>
+          </div>
         </div>
-      </div>
 
-      <!-- 追蹤商品列表 -->
-      <div class="d-flex justify-content-between align-items-center mb-3">
-        <h5 class="fw-bold mb-0"><i class="bi bi-list-task me-2"></i>追蹤清單 (<span id="itemCount">0</span>)</h5>
-        <small class="text-muted" id="lastUpdatedText"></small>
-      </div>
+        <div class="col-lg-4">
+          <!-- 搶購設定 -->
+          <div class="card shadow-sm border-0 rounded-3 mb-4 autobuy-box">
+            <div class="card-body p-4">
+              <h5 class="fw-bold text-dark mb-2"><i class="bi bi-lightning-charge-fill text-warning me-2"></i>自動加車與搶購模組</h5>
+              <p class="small text-muted mb-3">階梯式保護：每一段失敗至少保留前段正常執行並即時通知！</p>
 
-      <div id="productList" class="d-flex flex-column gap-3">
-        <div class="text-center py-5 text-muted">正在載入商品清單...</div>
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="cfgAutobuyEnabled">
+                <label class="form-check-label fw-bold" for="cfgAutobuyEnabled">⚡ 啟用第一階段：自動加入購物車</label>
+              </div>
+              <small class="text-muted d-block mb-3">補貨時自動把商品鎖在購物車，推播「已放入購物車！請在 15 分鐘內結帳」。</small>
+
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="cfgAutoCheckout">
+                <label class="form-check-label fw-bold" for="cfgAutoCheckout">🚀 啟用第二階段：自動直達結帳確認</label>
+              </div>
+              <small class="text-muted d-block mb-3">加車後自動推進至最後付款確認頁面，為您省下所有排隊步驟。</small>
+
+              <div class="mb-3">
+                <label class="form-label small fw-bold mb-1">電商登入 Cookie (推薦貼上 Cookie JSON)</label>
+                <textarea id="cfgCookiesJson" rows="2" class="form-control form-control-sm" placeholder='可透過瀏覽器擴充套件導出 Cookie JSON 貼於此處'></textarea>
+                <div class="small text-success mt-1" id="cookieStatusText"></div>
+              </div>
+
+              <button class="btn btn-warning w-100 fw-bold py-2" onclick="saveAutobuyConfig()">
+                <i class="bi bi-save me-1"></i>儲存搶購模組設定
+              </button>
+            </div>
+          </div>
+
+          <!-- 一般偏好設定 -->
+          <div class="card shadow-sm border-0 rounded-3">
+            <div class="card-body p-4">
+              <h5 class="fw-bold mb-3"><i class="bi bi-sliders text-primary me-2"></i>巡檢與通知偏好設定</h5>
+              <div class="mb-3">
+                <label class="form-label fw-bold">🔄 背景掃描頻率 (爬蟲週期)</label>
+                <select id="cfgPollInterval" class="form-select">
+                  <option value="1">每 1 分鐘</option>
+                  <option value="3">每 3 分鐘</option>
+                  <option value="5" selected>每 5 分鐘 (建議)</option>
+                  <option value="10">每 10 分鐘</option>
+                </select>
+              </div>
+              <div class="mb-3">
+                <label class="form-label fw-bold">🔔 持續缺貨通知頻率</label>
+                <select id="cfgOosHours" class="form-select">
+                  <option value="1">每 1 小時</option>
+                  <option value="2">每 2 小時</option>
+                  <option value="4" selected>每 4 小時 (建議)</option>
+                  <option value="8">每 8 小時</option>
+                  <option value="12">每 12 小時</option>
+                  <option value="24">每 24 小時</option>
+                  <option value="0">🔕 僅補貨時通知 (關閉定期缺貨回報)</option>
+                </select>
+              </div>
+              <hr class="my-3">
+              <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="cfgLocalNotif" checked>
+                <label class="form-check-label fw-bold" for="cfgLocalNotif">啟用本機桌面推播通知</label>
+              </div>
+              <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="cfgTelegram" checked>
+                <label class="form-check-label fw-bold" for="cfgTelegram">啟用 Telegram 提醒通知</label>
+              </div>
+              <button class="btn btn-success w-100 fw-bold py-2" onclick="saveConfig()">
+                <i class="bi bi-check-lg me-1"></i>儲存設定
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- 右側：巡檢與通知、自動搶購偏好設定 -->
-    <div class="col-lg-4">
-      <!-- 自動搶購設定卡片 -->
-      <div class="card shadow-sm border-0 rounded-3 mb-4 autobuy-box">
-        <div class="card-body p-4">
-          <h5 class="fw-bold text-dark mb-2"><i class="bi bi-lightning-charge-fill text-warning me-2"></i>自動加車與搶購模組</h5>
-          <p class="small text-muted mb-3">階梯式保護：每一段失敗至少保留前段正常執行並即時通知！</p>
+    <!-- ======================= 分頁 2: 預約搶登入 / 定時任務 ======================= -->
+    <div class="tab-pane fade" id="pane-schedule" role="tabpanel">
+      <div class="row g-4">
+        <div class="col-lg-5">
+          <div class="card shadow-sm border-0 rounded-3">
+            <div class="card-body p-4">
+              <h5 class="fw-bold mb-3"><i class="bi bi-calendar-check text-primary me-2"></i>新增預約執行任務</h5>
+              <p class="small text-muted">只要設定目標時間（例如搶登入開放瞬間），系統會在時間一到自動載入並為您執行！</p>
 
-          <div class="form-check form-switch mb-2">
-            <input class="form-check-input" type="checkbox" id="cfgAutobuyEnabled">
-            <label class="form-check-label fw-bold" for="cfgAutobuyEnabled">⚡ 啟用第一階段：自動加入購物車</label>
+              <div class="mb-3">
+                <label class="form-label fw-bold">任務名稱</label>
+                <input type="text" id="schTitle" class="form-control" placeholder="例: 搶好市多特價品 / 搶預約名額">
+              </div>
+
+              <div class="mb-3">
+                <label class="form-label fw-bold">目標網址 (登入或活動頁面)</label>
+                <input type="url" id="schUrl" class="form-control" placeholder="https://...">
+              </div>
+
+              <div class="mb-3">
+                <label class="form-label fw-bold">預約執行時間</label>
+                <div class="input-group mb-2">
+                  <input type="datetime-local" id="schTimeInput" class="form-control">
+                  <button class="btn btn-outline-secondary" type="button" onclick="setScheduleImmediate()">立即執行</button>
+                </div>
+                <small class="text-muted">支援指定特定年月日時分秒，或選擇立即執行測試。</small>
+              </div>
+
+              <button class="btn btn-primary w-100 fw-bold py-2" onclick="createScheduledTask()">
+                <i class="bi bi-clock me-1"></i>建立預約任務
+              </button>
+            </div>
           </div>
-          <small class="text-muted d-block mb-3">補貨時自動把商品鎖在購物車，推播「已放入購物車！請在 15 分鐘內結帳」。</small>
-
-          <div class="form-check form-switch mb-2">
-            <input class="form-check-input" type="checkbox" id="cfgAutoCheckout">
-            <label class="form-check-label fw-bold" for="cfgAutoCheckout">🚀 啟用第二階段：自動直達結帳確認</label>
-          </div>
-          <small class="text-muted d-block mb-3">加車後自動推進至最後付款確認頁面，為您省下所有排隊步驟。</small>
-
-          <div class="mb-3">
-            <label class="form-label small fw-bold mb-1">電商登入 Session / Cookie (推薦貼上 Cookie JSON)</label>
-            <textarea id="cfgCookiesJson" rows="2" class="form-control form-control-sm" placeholder='可透過瀏覽器擴充套件導出 Cookie JSON 貼於此處'></textarea>
-            <div class="small text-success mt-1" id="cookieStatusText"></div>
-          </div>
-
-          <button class="btn btn-warning w-100 fw-bold py-2" onclick="saveAutobuyConfig()">
-            <i class="bi bi-save me-1"></i>儲存搶購模組設定
-          </button>
         </div>
-      </div>
 
-      <!-- 巡檢與通知偏好設定 -->
-      <div class="card shadow-sm border-0 rounded-3">
-        <div class="card-body p-4">
-          <h5 class="fw-bold mb-3"><i class="bi bi-sliders text-primary me-2"></i>巡檢與通知偏好設定</h5>
-
-          <div class="mb-3">
-            <label class="form-label fw-bold">🔄 背景掃描頻率 (爬蟲週期)</label>
-            <select id="cfgPollInterval" class="form-select">
-              <option value="1">每 1 分鐘</option>
-              <option value="3">每 3 分鐘</option>
-              <option value="5" selected>每 5 分鐘 (建議)</option>
-              <option value="10">每 10 分鐘</option>
-            </select>
+        <div class="col-lg-7">
+          <div class="card shadow-sm border-0 rounded-3">
+            <div class="card-body p-4">
+              <h5 class="fw-bold mb-3"><i class="bi bi-list-check text-primary me-2"></i>預約任務列表</h5>
+              <div id="scheduledTaskList" class="d-flex flex-column gap-2">
+                <div class="text-center py-4 text-muted">目前尚無預約任務。</div>
+              </div>
+            </div>
           </div>
-
-          <div class="mb-3">
-            <label class="form-label fw-bold">🔔 持續缺貨通知頻率</label>
-            <select id="cfgOosHours" class="form-select">
-              <option value="1">每 1 小時</option>
-              <option value="2">每 2 小時</option>
-              <option value="4" selected>每 4 小時 (建議)</option>
-              <option value="8">每 8 小時</option>
-              <option value="12">每 12 小時</option>
-              <option value="24">每 24 小時</option>
-              <option value="0">🔕 僅補貨時通知 (關閉定期缺貨回報)</option>
-            </select>
-          </div>
-
-          <hr class="my-3">
-
-          <div class="form-check form-switch mb-2">
-            <input class="form-check-input" type="checkbox" id="cfgLocalNotif" checked>
-            <label class="form-check-label fw-bold" for="cfgLocalNotif">啟用本機/瀏覽器推播通知</label>
-          </div>
-          <small class="text-muted d-block mb-3">當庫存狀態變化或補貨時，在螢幕右下角彈出桌面推播通知與音效。</small>
-
-          <div class="form-check form-switch mb-2">
-            <input class="form-check-input" type="checkbox" id="cfgTelegram" checked>
-            <label class="form-check-label fw-bold" for="cfgTelegram">啟用 Telegram 提醒通知</label>
-          </div>
-          <small class="text-muted d-block mb-3">若您不想使用 Telegram，取消勾選此處即可完全只在本機運作。</small>
-
-          <button class="btn btn-success w-100 fw-bold py-2 mt-2" onclick="saveConfig()">
-            <i class="bi bi-check-lg me-1"></i>儲存一般偏好設定
-          </button>
         </div>
       </div>
     </div>
+
+    <!-- ======================= 分頁 3: 萬用網頁爬蟲精靈 (含小白 F12 指南) ======================= -->
+    <div class="tab-pane fade" id="pane-custom" role="tabpanel">
+      <div class="row g-4">
+        <!-- 左側：F12 視覺化新手教學 -->
+        <div class="col-lg-6">
+          <div class="card shadow-sm border-0 rounded-3">
+            <div class="card-body p-4">
+              <h5 class="fw-bold text-primary mb-3">
+                <i class="bi bi-lightbulb-fill text-warning me-2"></i>新手小白 F12 抓取教學：如何告訴程式要看哪裡？
+              </h5>
+              <p class="text-muted small">不用懂寫程式！只要在你想監控的網頁上跟著這 4 個動作，就能讓程式知道該抓哪個欄位：</p>
+
+              <div class="f12-box mb-3">
+                <strong class="text-primary">步驟 1：打開瀏覽器開發者工具 (F12)</strong>
+                <p class="small text-muted mb-0">在任何網頁按下鍵盤的 <kbd>F12</kbd>（或在畫面上點滑鼠右鍵 -> 點「檢查」）。</p>
+              </div>
+
+              <div class="f12-box mb-3">
+                <strong class="text-primary">步驟 2：點擊左上角的「小箭頭」選擇工具</strong>
+                <p class="small text-muted mb-0">在彈出的視窗左上角，有一個箭頭游標圖示（或按快捷鍵 <kbd>Ctrl+Shift+C</kbd>）。點擊它，游標會變成選取模式。</p>
+              </div>
+
+              <div class="f12-box mb-3">
+                <strong class="text-primary">步驟 3：用滑鼠點擊網頁上你想監控的欄位</strong>
+                <p class="small text-muted mb-0">例如點擊「剩餘庫存數量」或「加入購物車」按鈕，右邊的程式碼會自動跳到對應的那一行！</p>
+              </div>
+
+              <div class="f12-box mb-3">
+                <strong class="text-primary">步驟 4：複製選擇器 (Copy Selector)</strong>
+                <p class="small text-muted mb-0">在反藍的那行程式碼點滑鼠右鍵 -> 選擇 <strong>Copy (複製)</strong> -> 點 <strong>Copy selector (複製選擇器)</strong>，然後貼到右邊的輸入框即可！</p>
+              </div>
+
+              <div class="alert alert-info py-2 small mb-0">
+                <i class="bi bi-info-circle me-1"></i><strong>提示</strong>：若您連選擇器都懶得抓，也可以只輸入想尋找的<strong>關鍵字</strong>（例如：<code>有現貨</code> 或 <code>已額滿</code>），程式會自動全網頁搜尋！
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右側：自訂規則建立與即時測試 -->
+        <div class="col-lg-6">
+          <div class="card shadow-sm border-0 rounded-3 mb-4">
+            <div class="card-body p-4">
+              <h5 class="fw-bold mb-3"><i class="bi bi-gear-wide-connected text-primary me-2"></i>建立與測試自訂爬蟲規則</h5>
+
+              <div class="mb-3">
+                <label class="form-label fw-bold">規則名稱</label>
+                <input type="text" id="custRuleName" class="form-control" placeholder="例: 監控羽球場地預約 / 特賣會狀態">
+              </div>
+
+              <div class="mb-3">
+                <label class="form-label fw-bold">目標網頁網址</label>
+                <input type="url" id="custRuleUrl" class="form-control" placeholder="https://...">
+              </div>
+
+              <div class="mb-3">
+                <label class="form-label fw-bold">CSS 選擇器 (貼上步驟 4 複製的內容，選填)</label>
+                <input type="text" id="custRuleSelector" class="form-control" placeholder="例: #stock-count 或 .btn-buy">
+              </div>
+
+              <div class="mb-3">
+                <label class="form-label fw-bold">欲監控的文字或關鍵字 (選填)</label>
+                <input type="text" id="custRuleMatchText" class="form-control" placeholder="例: 可預約 / 有名額 / 補貨中">
+              </div>
+
+              <div class="d-flex gap-2">
+                <button class="btn btn-outline-primary w-50 fw-bold" onclick="testCustomCrawl()">
+                  <span id="testBtnSpinner" class="spinner-border spinner-border-sm d-none me-1"></span>🔍 即時測試抓取
+                </button>
+                <button class="btn btn-primary w-50 fw-bold" onclick="saveCustomRule()">
+                  <i class="bi bi-plus-lg me-1"></i>儲存為監控規則
+                </button>
+              </div>
+
+              <!-- 測試結果呈現區塊 -->
+              <div id="testResultBox" class="mt-3 p-3 bg-light rounded d-none">
+                <h6 class="fw-bold mb-2">測試抓取結果預覽：</h6>
+                <div id="testResultContent" class="small text-muted"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 已建立的自訂規則清單 -->
+          <div class="card shadow-sm border-0 rounded-3">
+            <div class="card-body p-4">
+              <h5 class="fw-bold mb-3"><i class="bi bi-card-checklist text-primary me-2"></i>已建立的自訂監控規則</h5>
+              <div id="customRuleList" class="d-flex flex-column gap-2">
+                <div class="text-center py-3 text-muted">尚無自訂規則。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 let lastNotificationId = null;
 
+// 桌面通知權限
 async function requestNotificationPermission() {
   if (!("Notification" in window)) {
     alert("此瀏覽器不支援桌面推播通知功能。");
@@ -764,10 +1029,11 @@ function updateNotifButton(perm) {
   } else if (perm === "denied") {
     btn.innerText = "本機推播通知：已被拒絕 ❌";
   } else {
-    btn.innerText = "啟用瀏覽器本機通知";
+    btn.innerText = "啟用本機推播通知";
   }
 }
 
+// 載入偏好設定
 async function loadConfig() {
   try {
     const res = await fetch("/api/config");
@@ -781,6 +1047,7 @@ async function loadConfig() {
   }
 }
 
+// 載入搶購模組設定
 async function loadAutobuyConfig() {
   try {
     const res = await fetch("/api/autobuy");
@@ -812,7 +1079,7 @@ async function saveAutobuyConfig() {
       body: JSON.stringify(payload)
     });
     if (res.ok) {
-      alert("✅ 自動搶購與加車模組設定已更新！");
+      alert("✅ 自動加車與搶購模組設定已更新！");
       document.getElementById("cfgCookiesJson").value = "";
       loadAutobuyConfig();
     } else {
@@ -845,6 +1112,7 @@ async function saveConfig() {
   }
 }
 
+// 載入商品清單
 async function fetchAll(isRefreshAll = false) {
   const container = document.getElementById("productList");
   if (isRefreshAll) {
@@ -885,16 +1153,12 @@ function renderProducts(items) {
             <h6 class="fw-bold mb-1 text-truncate" style="max-width: 75%;">${it.name || "未命名商品"}</h6>
             ${badge}
           </div>
-          <div class="small text-muted mb-2">
-            <i class="bi bi-info-circle me-1"></i>狀態詳情：${it.status_notes || "無"}
-          </div>
-          <div class="small text-muted mb-3">
-            <i class="bi bi-clock-history me-1"></i>最後檢查：${it.last_checked || "未記錄"}
-          </div>
+          <div class="small text-muted mb-2"><i class="bi bi-info-circle me-1"></i>狀態詳情：${it.status_notes || "無"}</div>
+          <div class="small text-muted mb-3"><i class="bi bi-clock-history me-1"></i>最後檢查：${it.last_checked || "未記錄"}</div>
           <div class="d-flex justify-content-between align-items-center">
             <div class="d-flex gap-2">
               <a href="${it.target_url}" target="_blank" class="btn btn-outline-primary btn-sm">
-                <i class="bi bi-box-arrow-up-right me-1"></i>開啟賣場頁面
+                <i class="bi bi-box-arrow-up-right me-1"></i>開啟賣場
               </a>
               <button class="btn btn-outline-secondary btn-sm" onclick="refreshSingle('${it.id}')">
                 <i class="bi bi-arrow-repeat me-1"></i>立即重新檢查
@@ -963,6 +1227,200 @@ async function refreshSingle(id) {
   }
 }
 
+// ======================== 預約任務管理 ========================
+function setScheduleImmediate() {
+  document.getElementById("schTimeInput").value = "";
+}
+
+async function loadScheduledTasks() {
+  try {
+    const res = await fetch("/api/scheduled_tasks");
+    const data = await res.json();
+    const list = data.tasks || [];
+    const container = document.getElementById("scheduledTaskList");
+    if (list.length === 0) {
+      container.innerHTML = '<div class="text-center py-4 text-muted">目前尚無預約任務。</div>';
+      return;
+    }
+    let html = "";
+    list.forEach(t => {
+      const isPending = t.status === "PENDING";
+      const statusBadge = isPending ? '<span class="badge bg-warning text-dark">等待觸發</span>' : '<span class="badge bg-success">已執行</span>';
+      html += `
+        <div class="card p-3 border-0 shadow-sm rounded-3">
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              <h6 class="fw-bold mb-1">${t.title} ${statusBadge}</h6>
+              <div class="small text-muted">目標：<a href="${t.target_url}" target="_blank">${t.target_url}</a></div>
+              <div class="small text-muted">預約時間：<code>${t.execute_at || "立即執行"}</code> | 建立於：${t.created_at}</div>
+              ${t.result_message ? `<div class="small text-primary mt-1">結果：${t.result_message}</div>` : ''}
+            </div>
+            <button class="btn btn-outline-danger btn-sm" onclick="deleteScheduledTask('${t.id}')">
+              <i class="bi bi-trash3"></i>
+            </button>
+          </div>
+        </div>
+      `;
+    });
+    container.innerHTML = html;
+  } catch (e) {
+    console.error("載入預約任務失敗", e);
+  }
+}
+
+async function createScheduledTask() {
+  const title = document.getElementById("schTitle").value.trim();
+  const url = document.getElementById("schUrl").value.trim();
+  const timeVal = document.getElementById("schTimeInput").value;
+  if (!url) {
+    alert("請輸入目標網址！");
+    return;
+  }
+  let execAt = "IMMEDIATE";
+  if (timeVal) {
+    // 轉換成 "YYYY-MM-DD HH:MM:SS"
+    execAt = timeVal.replace("T", " ") + ":00";
+  }
+  try {
+    const res = await fetch("/api/scheduled_tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, target_url: url, execute_at: execAt })
+    });
+    if (res.ok) {
+      alert("✅ 預約任務已成功建立！");
+      document.getElementById("schTitle").value = "";
+      document.getElementById("schUrl").value = "";
+      loadScheduledTasks();
+    }
+  } catch (e) {
+    alert("❌ 建立失敗: " + e);
+  }
+}
+
+async function deleteScheduledTask(id) {
+  try {
+    await fetch("/api/scheduled_tasks/" + id, { method: "DELETE" });
+    loadScheduledTasks();
+  } catch (e) {
+    alert("刪除失敗: " + e);
+  }
+}
+
+// ======================== 自訂爬蟲與測試 ========================
+async function testCustomCrawl() {
+  const url = document.getElementById("custRuleUrl").value.trim();
+  const selector = document.getElementById("custRuleSelector").value.trim();
+  const match_text = document.getElementById("custRuleMatchText").value.trim();
+  if (!url) {
+    alert("請填入欲測試的目標網頁網址！");
+    return;
+  }
+  const spinner = document.getElementById("testBtnSpinner");
+  spinner.classList.remove("d-none");
+  const resultBox = document.getElementById("testResultBox");
+  const resultContent = document.getElementById("testResultContent");
+  resultBox.classList.remove("d-none");
+  resultContent.innerHTML = '<div class="spinner-border spinner-border-sm me-1"></div>正在抓取與解析網頁中...';
+
+  try {
+    const res = await fetch("/api/custom_crawler/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, selector, match_text })
+    });
+    const data = await res.json();
+    if (!data.success) {
+      resultContent.innerHTML = `<span class="text-danger fw-bold">❌ 抓取失敗：${data.error}</span>`;
+      return;
+    }
+    let html = `<div><strong>網頁標題</strong>：${data.page_title}</div>`;
+    if (data.match_text_found !== null) {
+      html += `<div><strong>關鍵字 [${match_text}] 檢查</strong>：${data.match_text_found ? '<span class="text-success fw-bold">✅ 成功找到！</span>' : '<span class="text-danger fw-bold">❌ 未在此頁發現</span>'}</div>`;
+    }
+    html += `<div><strong>找到的元素數量</strong>：${data.found_count} 個</div>`;
+    if (data.elements && data.elements.length > 0) {
+      html += '<ul class="mt-2 mb-0 ps-3">';
+      data.elements.forEach(el => {
+        html += `<li><strong>&lt;${el.tag}&gt;</strong>: <code>${el.text || '(空文字)'}</code></li>`;
+      });
+      html += '</ul>';
+    }
+    resultContent.innerHTML = html;
+  } catch (e) {
+    resultContent.innerHTML = `<span class="text-danger">❌ 測試異常: ${e}</span>`;
+  } finally {
+    spinner.classList.add("d-none");
+  }
+}
+
+async function saveCustomRule() {
+  const name = document.getElementById("custRuleName").value.trim();
+  const target_url = document.getElementById("custRuleUrl").value.trim();
+  const selector = document.getElementById("custRuleSelector").value.trim();
+  const match_text = document.getElementById("custRuleMatchText").value.trim();
+  if (!target_url) {
+    alert("請輸入目標網址！");
+    return;
+  }
+  try {
+    const res = await fetch("/api/custom_crawler/rules", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, target_url, selector, match_text })
+    });
+    if (res.ok) {
+      alert("✅ 自訂爬蟲規則已成功保存！");
+      loadCustomRules();
+    }
+  } catch (e) {
+    alert("❌ 儲存失敗: " + e);
+  }
+}
+
+async function loadCustomRules() {
+  try {
+    const res = await fetch("/api/custom_crawler/rules");
+    const data = await res.json();
+    const list = data.rules || [];
+    const container = document.getElementById("customRuleList");
+    if (list.length === 0) {
+      container.innerHTML = '<div class="text-center py-3 text-muted">尚無自訂規則。</div>';
+      return;
+    }
+    let html = "";
+    list.forEach(r => {
+      html += `
+        <div class="card p-3 border-0 shadow-sm rounded-3">
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              <h6 class="fw-bold mb-1">${r.name}</h6>
+              <div class="small text-muted">網址：<a href="${r.target_url}" target="_blank">${r.target_url}</a></div>
+              <div class="small text-muted">選擇器：<code>${r.selector || '無 (全頁搜尋)'}</code> | 關鍵字：<code>${r.match_text || '無'}</code></div>
+            </div>
+            <button class="btn btn-outline-danger btn-sm" onclick="deleteCustomRule('${r.id}')">
+              <i class="bi bi-trash3"></i>
+            </button>
+          </div>
+        </div>
+      `;
+    });
+    container.innerHTML = html;
+  } catch (e) {
+    console.error("載入自訂規則失敗", e);
+  }
+}
+
+async function deleteCustomRule(id) {
+  try {
+    await fetch("/api/custom_crawler/rules/" + id, { method: "DELETE" });
+    loadCustomRules();
+  } catch (e) {
+    alert("刪除失敗: " + e);
+  }
+}
+
+// 輪詢本機桌面推播
 async function pollLocalNotifications() {
   try {
     const url = "/api/notifications/poll" + (lastNotificationId ? "?since_id=" + lastNotificationId : "");
@@ -996,6 +1454,8 @@ window.addEventListener("DOMContentLoaded", () => {
   loadConfig();
   loadAutobuyConfig();
   fetchAll();
+  loadScheduledTasks();
+  loadCustomRules();
   pollLocalNotifications();
 });
 </script>
@@ -1011,7 +1471,7 @@ def index_page():
 if __name__ == "__main__":
     import uvicorn
     print("=" * 65)
-    print("🚀 啟動【本地 Web 控制台 + 階梯式自動加車/結帳 + 桌面推播系統】")
+    print("🚀 啟動【本地 Web 旗艦工作台 + 預約搶登入 + 萬用視覺爬蟲 + 桌面推播】")
     print("🌐 控制台網址: http://localhost:8000")
     print("📁 資料檔案: " + str(DATA_FILE))
     print("=" * 65)
