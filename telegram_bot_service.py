@@ -32,16 +32,30 @@ DATA_FILE = BASE_DIR / "tracked_products.json"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9200030096:AAFNpPRV2zbQj4DFya0pTSfLi7pUDG7_MR0").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "807996552").strip()
 
+CONFIG_FILE = BASE_DIR / "app_config.json"
+
 def load_data():
     default_config = {
         "is_active": True,
-        "poll_interval_minutes": 15,
+        "poll_interval_minutes": 5,
         "oos_periodic_notify_minutes": 240,
         "quiet_hours_enabled": True,
         "quiet_hours_start": 1,
         "quiet_hours_end": 5,
         "telegram": {"enabled": True}
     }
+    # 優先從 app_config.json 讀取 Web 設定
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as cf:
+                web_cfg = json.load(cf)
+                default_config["poll_interval_minutes"] = web_cfg.get("poll_interval_minutes", 5)
+                default_config["is_active"] = web_cfg.get("is_scheduler_running", True)
+                oos_h = web_cfg.get("oos_notify_hours", 4)
+                default_config["oos_periodic_notify_minutes"] = int(oos_h * 60)
+        except Exception:
+            pass
+
     if not DATA_FILE.exists():
         return default_config, []
     try:
@@ -58,6 +72,20 @@ def save_data(settings, products):
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump({"settings": settings, "products": products}, f, ensure_ascii=False, indent=2)
+        
+        # 同步回寫 app_config.json 讓 Web 控制台也即時生效
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as cf:
+                    web_cfg = json.load(cf)
+                web_cfg["poll_interval_minutes"] = settings.get("poll_interval_minutes", web_cfg.get("poll_interval_minutes", 5))
+                web_cfg["is_scheduler_running"] = settings.get("is_active", web_cfg.get("is_scheduler_running", True))
+                oos_m = settings.get("oos_periodic_notify_minutes", 240)
+                web_cfg["oos_notify_hours"] = round(oos_m / 60, 1)
+                with open(CONFIG_FILE, "w", encoding="utf-8") as cf:
+                    json.dump(web_cfg, cf, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
     except Exception as e:
         print(f"存檔失敗: {e}")
 

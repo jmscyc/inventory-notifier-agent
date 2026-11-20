@@ -707,6 +707,15 @@ async def startup_event():
         asyncio.create_task(telegram_bot_worker())
     asyncio.create_task(scheduled_tasks_worker())
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        from app.wakelock_module import wakelock_manager
+        wakelock_manager.release()
+        print("🛑 [Shutdown] 伺服器已正常終止，防休眠鎖定已安全釋放。")
+    except Exception:
+        pass
+
 @app.get("/api/items")
 def api_get_items():
     return {"items": load_tracked_items()}
