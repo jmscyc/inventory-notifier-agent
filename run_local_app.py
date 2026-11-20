@@ -118,14 +118,40 @@ def load_tracked_items() -> list:
         return []
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict):
+                raw_prods = data.get("products", [])
+                # 標準化欄位：相容 target_url 與 url，以及 in_stock 與 last_status
+                normalized = []
+                for p in raw_prods:
+                    if isinstance(p, dict):
+                        target_url = p.get("target_url") or p.get("url", "")
+                        in_stock = p.get("in_stock")
+                        if in_stock is None:
+                            last_st = p.get("last_status", "")
+                            in_stock = "現貨" in last_st or "有現貨" in last_st
+                        item_copy = dict(p)
+                        item_copy["target_url"] = target_url
+                        item_copy["in_stock"] = in_stock
+                        normalized.append(item_copy)
+                return normalized
+            elif isinstance(data, list):
+                return data
+            return []
     except Exception:
         return []
 
 def save_tracked_items(items: list):
     try:
+        data = {}
+        if DATA_FILE.exists():
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                if isinstance(raw, dict):
+                    data = raw
+        data["products"] = items
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"⚠️ 儲存商品清單失敗: {e}")
 
