@@ -20,6 +20,8 @@ import re
 import sys
 import time
 import zoneinfo
+import random
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, List
 
@@ -726,7 +728,7 @@ def save_tracked_items(items: list):
     except Exception as e:
         print(f"⚠️ 儲存商品清單失敗: {e}")
 
-def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes: str, item_id: str = "", preferred_option: str = "", current_price: str = "") -> dict:
+def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes: str, item_id: str = "", preferred_option: str = "", current_price: str = "", target_price: Optional[float] = None) -> dict:
     items = load_tracked_items()
     now_str = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -748,6 +750,8 @@ def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes:
             it["last_checked"] = now_str
             if preferred_option:
                 it["preferred_option"] = preferred_option
+            if target_price is not None:
+                it["target_price"] = target_price
             if current_price:
                 it["current_price"] = current_price
                 history = it.get("price_history", [])
@@ -764,7 +768,7 @@ def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes:
         init_history = []
         if current_price:
             init_history.append({"time": now_str, "price": current_price, "in_stock": in_stock})
-        items.append({
+        new_entry = {
             "id": item_id,
             "name": name or target_url,
             "target_url": target_url,
@@ -774,7 +778,10 @@ def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes:
             "preferred_option": preferred_option or "",
             "current_price": current_price or "",
             "price_history": init_history
-        })
+        }
+        if target_price is not None:
+            new_entry["target_price"] = target_price
+        items.append(new_entry)
 
     save_tracked_items(items)
     return {"id": item_id, "name": name, "in_stock": in_stock}
@@ -1133,7 +1140,8 @@ async def background_scheduler():
                             await perform_check_and_notify_single(client, item, is_manual=False)
                         except Exception as e:
                             print(f"巡檢異常 ({item.get('id')}): {e}")
-                        await asyncio.sleep(2)
+                        # 擬真隨機抖動延遲 (1.5 ~ 3.5 秒)，徹底防止被電商 CDN/Cloudflare 標記為規律機器人
+                        await asyncio.sleep(random.uniform(1.5, 3.5))
                 
                 # 計算本次檢查結果摘要
                 refreshed_items = load_tracked_items()
@@ -1220,11 +1228,28 @@ async def telegram_bot_worker():
 # 5. FastAPI 路由與 API
 # =====================================================================
 
-app = FastAPI(title="商品庫存監控與智慧自動化控制台")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: 啟動背景排程與預約工作
+    asyncio.create_task(background_scheduler())
+    if os.getenv("ENABLE_LOCAL_TG_WORKER", "false").lower() == "true":
+        asyncio.create_task(telegram_bot_worker())
+    asyncio.create_task(scheduled_tasks_worker())
+    yield
+    # Shutdown: 安全釋放防休眠鎖
+    try:
+        from app.wakelock_module import wakelock_manager
+        wakelock_manager.release()
+        print("🛑 [Shutdown] 伺服器已正常終止，防休眠鎖定已安全釋放。")
+    except Exception:
+        pass
+
+app = FastAPI(title="商品庫存監控與智慧自動化控制台", lifespan=lifespan)
 
 class AddItemReq(BaseModel):
     url: str
     preferred_option: Optional[str] = ""
+    target_price: Optional[float] = None
 
 class UpdateConfigReq(BaseModel):
     poll_interval_minutes: int
@@ -1270,23 +1295,6 @@ class AddCustomRuleReq(BaseModel):
     match_text: Optional[str] = ""
     check_type: Optional[str] = "text_contains"
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(background_scheduler())
-    # 避免與專屬 telegram_bot_service 搶奪 update 衝突
-    if os.getenv("ENABLE_LOCAL_TG_WORKER", "false").lower() == "true":
-        asyncio.create_task(telegram_bot_worker())
-    asyncio.create_task(scheduled_tasks_worker())
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    try:
-        from app.wakelock_module import wakelock_manager
-        wakelock_manager.release()
-        print("🛑 [Shutdown] 伺服器已正常終止，防休眠鎖定已安全釋放。")
-    except Exception:
-        pass
-
 @app.get("/api/items")
 def api_get_items():
     return {"items": load_tracked_items()}
@@ -1295,13 +1303,21 @@ def api_get_items():
 async def api_add_item(req: AddItemReq):
     url = req.url.strip()
     preferred_option = req.preferred_option.strip() if req.preferred_option else ""
+    target_price = req.target_price
     if not url.startswith("http"):
         return JSONResponse({"success": False, "message": "請輸入有效的 HTTP/HTTPS 商品網址！"}, status_code=400)
     crawl_res = await asyncio.to_thread(check_product_inventory, url)
     title = crawl_res.get("title", url)
     in_stock = crawl_res.get("in_stock", False)
     status_desc = crawl_res.get("status_description", "")
-    item = add_or_update_item(name=title, target_url=url, in_stock=in_stock, status_notes=status_desc, preferred_option=preferred_option)
+    item = add_or_update_item(
+        name=title,
+        target_url=url,
+        in_stock=in_stock,
+        status_notes=status_desc,
+        preferred_option=preferred_option,
+        target_price=target_price
+    )
     # 重設通知狀態為 None，讓新增後首次檢查或即刻觸發有貨/缺貨通知
     NOTIFY_STATE[item["id"]] = {"last_notified_stock": None, "last_notified_time": 0}
     # 若有現貨，新增當下立即發出第一次推播通知！
@@ -1325,7 +1341,7 @@ async def api_refresh_all():
                     await perform_check_and_notify_single(client, it, is_manual=False)
                 except Exception as e:
                     print(f"refresh_all 異常: {e}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(random.uniform(1.2, 2.8))
     fresh = load_tracked_items()
     return {"success": True, "items": fresh}
 
@@ -1608,6 +1624,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   <title>智慧庫存監控、預約搶登入與視覺爬蟲工作台</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     body { background-color: #f4f6f9; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
     .header-card { background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%); color: white; border-radius: 12px; }
@@ -1738,18 +1755,39 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             <div class="card-body p-4">
               <h5 class="fw-bold mb-3"><i class="bi bi-plus-circle text-primary me-2"></i>新增追蹤商品</h5>
               <div class="row g-2">
-                <div class="col-md-8">
+                <div class="col-md-6">
                   <input type="url" id="newUrlInput" class="form-control form-control-lg" placeholder="請貼上商品完整網址 (例: https://www.costco.com.tw/.../p/123456)">
                 </div>
-                <div class="col-md-4">
-                  <input type="text" id="newPreferredOptionInput" class="form-control form-control-lg" placeholder="指定尺寸/規格 (選填, 例: L號/黑)">
+                <div class="col-md-3">
+                  <input type="text" id="newPreferredOptionInput" class="form-control form-control-lg" placeholder="規格 (例: L號/黑色)">
+                </div>
+                <div class="col-md-3">
+                  <input type="number" id="newTargetPriceInput" class="form-control form-control-lg" placeholder="預算上限 (例: 1500)">
                 </div>
               </div>
               <div class="d-flex justify-content-between align-items-center mt-3">
-                <div class="form-text text-muted">支援指定顏色、尺寸自動點選。加入前即刻至頁面檢驗是否具備現貨與數量選單。</div>
+                <div class="form-text text-muted">支援規格自動選取與預算上限把關（高於預算不誤搶）。</div>
                 <button class="btn btn-primary px-4 fw-bold" id="addBtn" onclick="addProduct()">
                   <span id="addBtnSpinner" class="spinner-border spinner-border-sm d-none me-1"></span>新增追蹤
                 </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 🔍 商品搜尋與即時狀態篩選列 -->
+          <div class="card shadow-sm border-0 mb-3 rounded-3 bg-white p-2">
+            <div class="row g-2 align-items-center">
+              <div class="col-md-5">
+                <div class="input-group input-group-sm">
+                  <span class="input-group-text bg-light border-0"><i class="bi bi-search"></i></span>
+                  <input type="text" id="productSearchInput" class="form-control border-0 bg-light" placeholder="即時關鍵字搜尋..." oninput="filterAndRenderProducts()">
+                </div>
+              </div>
+              <div class="col-md-7 d-flex justify-content-md-end gap-1 flex-wrap">
+                <button class="btn btn-sm btn-primary filter-btn active" data-filter="all" onclick="setProductFilter('all', this)">全部 (<span id="countAll">0</span>)</button>
+                <button class="btn btn-sm btn-outline-success filter-btn" data-filter="in_stock" onclick="setProductFilter('in_stock', this)">現貨 (<span id="countInStock">0</span>)</button>
+                <button class="btn btn-sm btn-outline-danger filter-btn" data-filter="out_of_stock" onclick="setProductFilter('out_of_stock', this)">缺貨 (<span id="countOos">0</span>)</button>
+                <button class="btn btn-sm btn-outline-warning filter-btn text-dark" data-filter="has_budget" onclick="setProductFilter('has_budget', this)">有設預算 (<span id="countBudget">0</span>)</button>
               </div>
             </div>
           </div>
@@ -2142,6 +2180,30 @@ HTML_DASHBOARD = """<!DOCTYPE html>
           <i class="bi bi-clipboard-check me-1"></i>點擊一鍵複製
         </button>
       </div>
+<!-- ======================= 價格歷史走勢圖視窗 (Modal) ======================= -->
+<div class="modal fade" id="modalPriceHistory" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content rounded-4 border-0 shadow">
+      <div class="modal-header bg-primary text-white">
+        <h5 class="modal-title fw-bold"><i class="bi bi-graph-up-arrow me-2"></i>📈 歷史價格走勢圖</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-4">
+        <h6 id="chartItemTitle" class="fw-bold text-dark mb-1">商品名稱</h6>
+        <div class="d-flex gap-2 mb-3">
+          <span class="badge bg-warning text-dark" id="chartCurrentPrice">現價: -</span>
+          <span class="badge bg-secondary" id="chartTargetPrice">預算上限: -</span>
+        </div>
+        <div style="position: relative; height: 320px; width: 100%;">
+          <canvas id="priceHistoryCanvas"></canvas>
+        </div>
+        <div class="mt-3 p-2 bg-light rounded text-muted small" id="chartSummaryText">
+          載入走勢資訊中...
+        </div>
+      </div>
+      <div class="modal-footer bg-light">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">關閉</button>
+      </div>
     </div>
   </div>
 </div>
@@ -2422,6 +2484,9 @@ async function saveConfig() {
   }
 }
 
+let allProductsCache = [];
+let currentProductFilter = "all";
+
 // 載入商品清單
 async function fetchAll(isRefreshAll = false) {
   const container = document.getElementById("productList");
@@ -2433,24 +2498,66 @@ async function fetchAll(isRefreshAll = false) {
     const method = isRefreshAll ? "POST" : "GET";
     const res = await fetch(url, { method });
     const data = await res.json();
-    renderProducts(data.items || []);
+    allProductsCache = data.items || [];
+    filterAndRenderProducts();
   } catch (e) {
     container.innerHTML = '<div class="alert alert-danger">載入失敗: ' + e + '</div>';
   }
 }
 
-function renderProducts(items) {
-  const container = document.getElementById("productList");
-  document.getElementById("itemCount").innerText = items.length;
-  document.getElementById("lastUpdatedText").innerText = "最後更新：" + new Date().toLocaleTimeString();
+function setProductFilter(filterType, btnEl) {
+  currentProductFilter = filterType;
+  document.querySelectorAll(".filter-btn").forEach(b => {
+    b.classList.remove("active", "btn-primary");
+    b.classList.add("btn-outline-secondary");
+  });
+  if (btnEl) {
+    btnEl.classList.remove("btn-outline-secondary");
+    btnEl.classList.add("active", "btn-primary");
+  }
+  filterAndRenderProducts();
+}
 
-  if (items.length === 0) {
-    container.innerHTML = '<div class="card p-5 text-center text-muted border-0 shadow-sm rounded-3">📭 目前尚無追蹤商品。請在上方的輸入框貼入電商網址開始監控！</div>';
+function filterAndRenderProducts() {
+  const container = document.getElementById("productList");
+  const keyword = (document.getElementById("productSearchInput")?.value || "").trim().toLowerCase();
+
+  // 更新計數標籤
+  let inStockCount = 0;
+  let oosCount = 0;
+  let budgetCount = 0;
+  allProductsCache.forEach(p => {
+    if (p.in_stock) inStockCount++;
+    else oosCount++;
+    if (p.target_price) budgetCount++;
+  });
+  if (document.getElementById("countAll")) document.getElementById("countAll").innerText = allProductsCache.length;
+  if (document.getElementById("countInStock")) document.getElementById("countInStock").innerText = inStockCount;
+  if (document.getElementById("countOos")) document.getElementById("countOos").innerText = oosCount;
+  if (document.getElementById("countBudget")) document.getElementById("countBudget").innerText = budgetCount;
+  if (document.getElementById("itemCount")) document.getElementById("itemCount").innerText = allProductsCache.length;
+  if (document.getElementById("lastUpdatedText")) document.getElementById("lastUpdatedText").innerText = "最後更新：" + new Date().toLocaleTimeString();
+
+  let filtered = allProductsCache.filter(it => {
+    if (currentProductFilter === "in_stock" && !it.in_stock) return false;
+    if (currentProductFilter === "out_of_stock" && it.in_stock) return false;
+    if (currentProductFilter === "has_budget" && !it.target_price) return false;
+    if (keyword) {
+      const matchName = (it.name || "").toLowerCase().includes(keyword);
+      const matchUrl = (it.target_url || "").toLowerCase().includes(keyword);
+      const matchOpt = (it.preferred_option || "").toLowerCase().includes(keyword);
+      if (!matchName && !matchUrl && !matchOpt) return false;
+    }
+    return true;
+  });
+
+  if (filtered.length === 0) {
+    container.innerHTML = '<div class="card p-5 text-center text-muted border-0 shadow-sm rounded-3">📭 目前無符合條件的追蹤商品。</div>';
     return;
   }
 
   let html = "";
-  items.forEach(it => {
+  filtered.forEach(it => {
     const isStock = it.in_stock;
     const badge = isStock 
       ? '<span class="badge badge-in-stock px-3 py-2"><i class="bi bi-check-circle-fill me-1"></i>有現貨</span>'
@@ -2458,6 +2565,7 @@ function renderProducts(items) {
 
     const optBadge = it.preferred_option ? `<span class="badge bg-info text-dark ms-2"><i class="bi bi-tag-fill me-1"></i>規格: ${it.preferred_option}</span>` : '';
     const priceBadge = it.current_price ? `<span class="badge bg-warning text-dark ms-2 fs-6"><i class="bi bi-currency-dollar me-0"></i>${it.current_price}</span>` : '';
+    const budgetBadge = it.target_price ? `<span class="badge bg-secondary ms-2"><i class="bi bi-shield-check me-1"></i>預算上限: $${it.target_price}</span>` : '';
 
     html += `
       <div class="card product-card p-3">
@@ -2466,6 +2574,7 @@ function renderProducts(items) {
             <div>
               <h6 class="fw-bold mb-1 text-truncate d-inline-block" style="max-width: 550px;">${it.name || "未命名商品"} ${optBadge}</h6>
               ${priceBadge}
+              ${budgetBadge}
             </div>
             ${badge}
           </div>
@@ -2479,7 +2588,9 @@ function renderProducts(items) {
               <button class="btn btn-outline-secondary btn-sm" onclick="refreshSingle('${it.id}')">
                 <i class="bi bi-arrow-repeat me-1"></i>立即重新檢查
               </button>
-              ${it.price_history && it.price_history.length > 1 ? `<button class="btn btn-outline-info btn-sm text-dark" onclick="showPriceHistory('${encodeURIComponent(JSON.stringify(it))}')"><i class="bi bi-graph-up me-1"></i>價格趨勢</button>` : ''}
+              <button class="btn btn-outline-info btn-sm text-dark" onclick="showPriceHistory('${encodeURIComponent(JSON.stringify(it))}')">
+                <i class="bi bi-graph-up me-1"></i>價格趨勢圖
+              </button>
             </div>
             <button class="btn btn-outline-danger btn-sm" onclick="deleteProduct('${it.id}')">
               <i class="bi bi-trash3 me-1"></i>移除
@@ -2495,8 +2606,10 @@ function renderProducts(items) {
 async function addProduct() {
   const input = document.getElementById("newUrlInput");
   const optInput = document.getElementById("newPreferredOptionInput");
+  const budgetInput = document.getElementById("newTargetPriceInput");
   const url = input.value.trim();
   const preferred_option = optInput ? optInput.value.trim() : "";
+  const target_price = budgetInput && budgetInput.value.trim() ? parseFloat(budgetInput.value.trim()) : null;
   if (!url) {
     alert("請貼上商品網址！");
     return;
@@ -2510,12 +2623,13 @@ async function addProduct() {
     const res = await fetch("/api/items", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, preferred_option })
+      body: JSON.stringify({ url, preferred_option, target_price })
     });
     const data = await res.json();
     if (res.ok) {
       input.value = "";
       if (optInput) optInput.value = "";
+      if (budgetInput) budgetInput.value = "";
       fetchAll();
     } else {
       alert("❌ " + (data.message || "新增失敗"));
@@ -2605,22 +2719,79 @@ async function refreshSingle(id) {
   }
 }
 
+let priceChartInstance = null;
 function showPriceHistory(itemJsonEncoded) {
   try {
     const item = JSON.parse(decodeURIComponent(itemJsonEncoded));
     const history = item.price_history || [];
-    if (history.length === 0) {
-      alert("此商品目前尚未記錄到價格波動。");
-      return;
+    
+    document.getElementById("chartItemTitle").innerText = item.name || "未命名商品";
+    document.getElementById("chartCurrentPrice").innerText = "現價: " + (item.current_price || "未取得");
+    document.getElementById("chartTargetPrice").innerText = item.target_price ? "預算上限: $" + item.target_price : "未設預算上限";
+
+    const modal = new bootstrap.Modal(document.getElementById("modalPriceHistory"));
+    modal.show();
+
+    // 建立或重新繪製 Chart.js
+    const ctx = document.getElementById("priceHistoryCanvas").getContext("2d");
+    if (priceChartInstance) {
+      priceChartInstance.destroy();
     }
-    let msg = `📈【${item.name}】歷史價格變動趨勢：\n\n`;
-    history.forEach(h => {
-      const stock = h.in_stock ? "🟢 有現貨" : "🔴 缺貨";
-      msg += `🕒 ${h.time} ➔ 價格: ${h.price || "未標示"} (${stock})\n`;
+
+    let labels = [];
+    let prices = [];
+    if (history.length > 0) {
+      history.forEach(h => {
+        labels.push(h.time ? h.time.split(" ")[1] || h.time : "");
+        const num = parseFloat(String(h.price).replace(/[^0-9.]/g, "")) || 0;
+        prices.push(num);
+      });
+    } else {
+      labels.push("當前");
+      prices.push(parseFloat(String(item.current_price).replace(/[^0-9.]/g, "")) || 0);
+    }
+
+    priceChartInstance = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels: labels,
+        datasets: [{
+          label: "歷史價格 (NTD)",
+          data: prices,
+          borderColor: "#0d6efd",
+          backgroundColor: "rgba(13, 110, 253, 0.1)",
+          fill: true,
+          tension: 0.3,
+          pointRadius: 4,
+          pointBackgroundColor: "#0d6efd"
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          y: {
+            beginAtZero: false,
+            ticks: {
+              callback: function(value) { return "$" + value; }
+            }
+          }
+        }
+      }
     });
-    alert(msg);
+
+    const summaryText = document.getElementById("chartSummaryText");
+    const validPrices = prices.filter(p => p > 0);
+    if (validPrices.length > 0) {
+      const minP = Math.min(...validPrices);
+      const maxP = Math.max(...validPrices);
+      summaryText.innerHTML = `📊 價格統計：歷史最低價 <b>$${minP}</b> | 歷史最高價 <b>$${maxP}</b> | 累積記錄 <b>${history.length || 1}</b> 次`;
+    } else {
+      summaryText.innerText = "尚無歷史價格波動記錄。";
+    }
+
   } catch (err) {
-    alert("解析價格歷史失敗: " + err);
+    alert("開啟價格趨勢圖失敗: " + err);
   }
 }
 
