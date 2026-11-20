@@ -29,21 +29,71 @@ except Exception:
     # 支援 Windows 預設未安裝 tzdata 之環境
     TAIPEI_TZ = datetime.timezone(datetime.timedelta(hours=8))
 
+TRACKED_PRODUCTS_FILE = DATA_DIR / "tracked_products.json"
+
+def sync_to_github_background(commit_msg: str):
+    """在背景執行自動 Git Commit & Push，將新規則反向更新回 GitHub"""
+    import subprocess
+    def _run():
+        try:
+            cmd = (
+                f'export PATH="$HOME/.local/bin:$PATH" && '
+                f'cd "{DATA_DIR}" && '
+                f'git config user.name "GitHub Actions AutoSync" && '
+                f'git config user.email "bot@github.local" && '
+                f'git add tracked_products.json && '
+                f'git commit -m "{commit_msg}" && '
+                f'git push origin main'
+            )
+            subprocess.run(cmd, shell=True, capture_output=True, timeout=30)
+            print(f"🚀 已成功反向自動同步更新至 GitHub: {commit_msg}")
+        except Exception as e:
+            print(f"⚠️ 自動同步至 GitHub 異常: {e}")
+
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+
 def load_custom_rules() -> List[dict]:
-    if not RULES_FILE.exists():
-        return []
-    try:
-        with open(RULES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    # 優先從統一的 tracked_products.json 讀取 custom_rules
+    if TRACKED_PRODUCTS_FILE.exists():
+        try:
+            with open(TRACKED_PRODUCTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "custom_rules" in data:
+                    return data["custom_rules"]
+        except Exception:
+            pass
+
+    # 相容舊檔案
+    if RULES_FILE.exists():
+        try:
+            with open(RULES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
 
 def save_custom_rules(rules: List[dict]):
+    # 1. 寫入 tracked_products.json
+    try:
+        data = {}
+        if TRACKED_PRODUCTS_FILE.exists():
+            with open(TRACKED_PRODUCTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if not isinstance(data, dict):
+            data = {"products": data} if isinstance(data, list) else {}
+        data["custom_rules"] = rules
+        with open(TRACKED_PRODUCTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ 儲存 custom_rules 至 tracked_products.json 失敗: {e}")
+
+    # 2. 同步維護舊版檔案
     try:
         with open(RULES_FILE, "w", encoding="utf-8") as f:
             json.dump(rules, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ 儲存自訂爬蟲規則失敗: {e}")
+    except Exception:
+        pass
 
 def add_custom_rule(name: str, target_url: str, selector: str = "", match_text: str = "", check_type: str = "text_contains") -> dict:
     rules = load_custom_rules()
@@ -61,6 +111,7 @@ def add_custom_rule(name: str, target_url: str, selector: str = "", match_text: 
     }
     rules.append(new_rule)
     save_custom_rules(rules)
+    sync_to_github_background(f"Auto-sync: 新增自訂爬蟲規則 [{name or '自訂規則'}]")
     return new_rule
 
 def delete_custom_rule(rule_id: str) -> bool:
@@ -68,6 +119,7 @@ def delete_custom_rule(rule_id: str) -> bool:
     new_rules = [r for r in rules if r.get("id") != rule_id]
     if len(new_rules) != len(rules):
         save_custom_rules(new_rules)
+        sync_to_github_background(f"Auto-sync: 刪除自訂爬蟲規則 [{rule_id}]")
         return True
     return False
 

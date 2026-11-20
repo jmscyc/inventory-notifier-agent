@@ -1,15 +1,16 @@
 {
-  "_說明": "【好市多智慧監控設定檔】直接在此修改或透過 Telegram 隨時調整！",
   "settings": {
     "is_active": true,
-    "quiet_hours_enabled": true,
+    "quiet_hours_enabled": false,
     "quiet_hours_start": 1,
     "quiet_hours_end": 5,
     "oos_periodic_notify_hours": 4,
     "telegram": {
       "enabled": true,
       "bot_username": "@jmsaitry_bot"
-    }
+    },
+    "oos_periodic_notify_minutes": 240,
+    "poll_interval_minutes": 5
   },
   "products": [
     {
@@ -17,9 +18,9 @@
       "name": "Costco",
       "url": "https://www.costco.com.tw/p/142997",
       "enabled": true,
-      "last_status": "🔴 缺貨 (未發現加入購物車按鈕)",
-      "last_checked": "2026-11-20 19:14:35"
+      "last_status": "🔴 缺貨中",
+      "last_checked": "2026-11-20 19:17:12"
     }
   ],
-  "scheduled_tasks": []
+  "custom_rules": []
 }

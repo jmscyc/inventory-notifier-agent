@@ -32,7 +32,7 @@ LAST_STATE_FILE = BASE_DIR / "last_check_status.json"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-def load_config_and_products() -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def load_config_and_products() -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     default_config = {
         "is_active": True,
         "quiet_hours_enabled": True,
@@ -42,35 +42,35 @@ def load_config_and_products() -> Tuple[Dict[str, Any], List[Dict[str, Any]], Li
         "telegram": {"enabled": True}
     }
     if not DATA_FILE.exists():
-        return default_config, [], []
+        return default_config, [], [], []
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, list):
-                return default_config, data, []
+                return default_config, data, [], []
             settings = data.get("settings", default_config)
             products = data.get("products", [])
             scheduled_tasks = data.get("scheduled_tasks", [])
-            return settings, products, scheduled_tasks
+            custom_rules = data.get("custom_rules", [])
+            return settings, products, scheduled_tasks, custom_rules
     except Exception as e:
         print(f"⚠️ 讀取 {DATA_FILE} 失敗: {e}")
-        return default_config, [], []
+        return default_config, [], [], []
 
-def save_config_and_products(settings: Dict[str, Any], products: List[Dict[str, Any]], scheduled_tasks: List[Dict[str, Any]] = None):
+def save_config_and_products(settings: Dict[str, Any], products: List[Dict[str, Any]], scheduled_tasks: List[Dict[str, Any]] = None, custom_rules: List[Dict[str, Any]] = None):
     try:
-        if scheduled_tasks is None:
-            scheduled_tasks = []
-        content = {
+        data = {
             "_說明": "【好市多智慧監控設定檔】直接在此修改或透過 Telegram 隨時調整！",
             "settings": settings,
             "products": products,
-            "scheduled_tasks": scheduled_tasks
+            "scheduled_tasks": scheduled_tasks or [],
+            "custom_rules": custom_rules or []
         }
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(content, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"⚠️ 儲存失敗: {e}")
+        print(f"⚠️ 儲存 {DATA_FILE} 失敗: {e}")
 
 def is_in_quiet_hours(settings: Dict[str, Any]) -> bool:
     if not settings.get("quiet_hours_enabled", True):
@@ -452,7 +452,7 @@ async def main():
     print(f"🕒 執行時間 (台灣時間): {now_taipei}")
     print("=" * 60)
 
-    settings, products, scheduled_tasks = load_config_and_products()
+    settings, products, scheduled_tasks, custom_rules = load_config_and_products()
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         settings, products, scheduled_tasks, tg_updated, trigger_immediate = await process_telegram_incoming_messages(
@@ -462,7 +462,7 @@ async def main():
         if not settings.get("is_active", True) and not trigger_immediate:
             print("⏸️ 系統設定為停用中 (is_active = false)，跳過本次巡檢。")
             if tg_updated:
-                save_config_and_products(settings, products, scheduled_tasks)
+                save_config_and_products(settings, products, scheduled_tasks, custom_rules)
             sys.exit(0)
 
         in_quiet = is_in_quiet_hours(settings)
@@ -472,6 +472,7 @@ async def main():
         in_stock_found = []
         oos_found = []
 
+        # 1. 巡檢標準電商 / 好市多商品
         for p in products:
             if not p.get("enabled", True):
                 continue
@@ -504,15 +505,66 @@ async def main():
                 oos_found.append(p)
                 print(f"🔴【缺貨中】{p['name']} ({status_desc})")
 
+        # 2. 巡檢自訂萬用網頁爬蟲規則 (新購物網站 / 預約規則)
+        for r in custom_rules:
+            r_name = r.get("name", "自訂規則")
+            r_url = r.get("target_url", "")
+            r_sel = r.get("selector", "")
+            r_match = r.get("match_text", "")
+            if not r_url:
+                continue
+
+            print(f"🎯 正在雲端巡檢自訂規則: {r_name} ...")
+            try:
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                resp = await client.get(r_url, headers=headers, timeout=12.0)
+                page_html = resp.text
+                soup = BeautifulSoup(page_html, "html.parser")
+
+                is_triggered = False
+                desc = "未觸發條件"
+                if r_sel:
+                    matched_nodes = soup.select(r_sel)
+                    if matched_nodes:
+                        txt = matched_nodes[0].get_text(strip=True)
+                        if r_match:
+                            if r_match.lower() in txt.lower():
+                                is_triggered = True
+                                desc = f"選擇器吻合且文字包含『{r_match}』: {txt[:40]}"
+                        else:
+                            is_triggered = True
+                            desc = f"選擇器元素存在: {txt[:40]}"
+                elif r_match:
+                    if r_match.lower() in page_html.lower():
+                        is_triggered = True
+                        desc = f"網頁中出現目標關鍵字『{r_match}』"
+
+                r["last_status"] = "🟢 觸發條件 (有貨/開放)" if is_triggered else f"⚪ 巡檢正常 ({desc})"
+                r["last_checked"] = now_taipei
+
+                if is_triggered:
+                    in_stock_found.append({"name": r_name, "url": r_url})
+                    if (not in_quiet or trigger_immediate) and settings.get("telegram", {}).get("enabled", True):
+                        await send_telegram_alert(
+                            client,
+                            f"🚨 **【新購物網站自動爬蟲觸發通知！】**",
+                            f"🎯 **規則名稱**：{r_name}\n🟢 **狀態**：{desc}\n⏰ **時間**：`{now_taipei}`",
+                            r_url
+                        )
+            except Exception as e:
+                print(f"自訂規則 {r_name} 爬蟲異常: {e}")
+
         # 若使用者按了【立即巡檢】，回傳詳細清單與按鈕
         if trigger_immediate:
             res_msg = f"🏁 **【立即巡檢報告完成】**\n\n"
             for it in products:
                 res_msg += f"• **{it.get('name')}**：`{it.get('last_status')}`\n"
+            for it in custom_rules:
+                res_msg += f"• **[自訂] {it.get('name')}**：`{it.get('last_status')}`\n"
             res_msg += f"\n⏰ 檢查時間：`{now_taipei}`"
             await send_telegram_alert(client, "📋 **巡檢報告**", res_msg)
 
-        save_config_and_products(settings, products, scheduled_tasks)
+        save_config_and_products(settings, products, scheduled_tasks, custom_rules)
 
         summary = f"共檢查 {len(products)} 件 (現貨: {len(in_stock_found)} / 缺貨: {len(oos_found)})"
         status_data = {
