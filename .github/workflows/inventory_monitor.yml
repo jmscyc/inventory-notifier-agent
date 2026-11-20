@@ -1,0 +1,30 @@
+name: 24/7 雲端自動庫存監控與 Telegram 推播
+
+on:
+  schedule:
+    # 每 15 分鐘自動在 GitHub 雲端執行一次 (台灣時間 24 小時全自動)
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # 支援在 GitHub 網頁上手動點擊隨時立即測試
+
+jobs:
+  check-inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 簽出專案代碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 3.11 環境
+        uses: setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝執行依賴
+        run: |
+          pip install httpx beautifulsoup4 python-dotenv tzdata
+
+      - name: 執行雲端庫存檢測與 Telegram 推播
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python github_actions_runner.py
