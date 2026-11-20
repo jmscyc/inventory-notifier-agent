@@ -371,13 +371,15 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
             NOTIFY_STATE[item_id] = {"last_notified_stock": last_notified_stock, "last_notified_time": last_notified_time}
             return
 
-        if in_stock and (last_notified_stock is not True):
-            should_send = True
-            flow_res = await execute_autobuy_flow(target_url, name)
-            notify_title = flow_res["status_title"]
-            notify_body = flow_res["status_message"]
-            action_url = flow_res["action_url"]
-            btn_text = flow_res["action_button_text"]
+        if in_stock:
+            # 有貨：若先前是缺貨、未曾通知，或者距離上次有貨通知超過 15 分鐘，持續提醒有現貨！
+            if (last_notified_stock is not True) or (now_ts - last_notified_time >= 900):
+                should_send = True
+                flow_res = await execute_autobuy_flow(target_url, name)
+                notify_title = flow_res["status_title"]
+                notify_body = flow_res["status_message"]
+                action_url = flow_res["action_url"]
+                btn_text = flow_res["action_button_text"]
 
         elif (not in_stock) and (last_notified_stock is None or last_notified_stock is True):
             should_send = True
@@ -610,7 +612,11 @@ async def api_add_item(req: AddItemReq):
     in_stock = crawl_res.get("in_stock", False)
     status_desc = crawl_res.get("status_description", "")
     item = add_or_update_item(name=title, target_url=url, in_stock=in_stock, status_notes=status_desc)
-    NOTIFY_STATE[item["id"]] = {"last_notified_stock": in_stock, "last_notified_time": time.time()}
+    # 重設通知狀態為 None，讓新增後首次檢查或即刻觸發有貨/缺貨通知
+    NOTIFY_STATE[item["id"]] = {"last_notified_stock": None, "last_notified_time": 0}
+    # 若有現貨，新增當下立即發出第一次推播通知！
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await perform_check_and_notify_single(client, item, is_manual=True)
     return {"success": True, "item": item, "in_stock": in_stock, "status_notes": status_desc}
 
 @app.delete("/api/items/{item_id}")
@@ -622,20 +628,16 @@ def api_delete_item(item_id: str):
 @app.post("/api/items/refresh_all")
 async def api_refresh_all():
     items = load_tracked_items()
-    async def refresh_one(it):
-        t_url = it.get("target_url")
-        if not t_url:
-            return it
-        c_res = await asyncio.to_thread(check_product_inventory, t_url)
-        it["in_stock"] = c_res.get("in_stock", False)
-        it["status_notes"] = c_res.get("status_description", "")
-        it["last_checked"] = c_res.get("checked_at", "")
-        if c_res.get("title") and c_res.get("title") != t_url:
-            it["name"] = c_res.get("title")
-        return it
-    fresh = await asyncio.gather(*(refresh_one(it) for it in items))
-    save_tracked_items(list(fresh))
-    return {"success": True, "items": list(fresh)}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for it in items:
+            if it.get("target_url"):
+                try:
+                    await perform_check_and_notify_single(client, it, is_manual=False)
+                except Exception as e:
+                    print(f"refresh_all 異常: {e}")
+                await asyncio.sleep(1)
+    fresh = load_tracked_items()
+    return {"success": True, "items": fresh}
 
 @app.post("/api/items/{item_id}/refresh")
 async def api_refresh_single(item_id: str):
