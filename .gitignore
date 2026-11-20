@@ -204,6 +204,8 @@ my_env.tfvars
 tools/a2a-inspector/
 
 # Credentials and private keys
+autobuy_config.json
+costco_cookies.json
 *.pem
 *-key.json
 credentials*.json

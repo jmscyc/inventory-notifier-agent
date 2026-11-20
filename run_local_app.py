@@ -36,6 +36,8 @@ from app.autobuy_module import (
     save_autobuy_config,
     load_saved_cookies,
     save_cookies,
+    get_masked_card_info,
+    get_last_diagnostic_export,
 )
 from app.scheduled_tasks_module import (
     load_scheduled_tasks,
@@ -570,9 +572,20 @@ class UpdateConfigReq(BaseModel):
 class UpdateAutobuyReq(BaseModel):
     enabled: bool
     auto_checkout: bool
+    auto_submit_payment: Optional[bool] = False
+    payment_method: Optional[str] = "stored_card"  # stored_card | custom_card | cod
+    card_number: Optional[str] = ""
+    card_exp_month: Optional[str] = ""
+    card_exp_year: Optional[str] = ""
+    card_cvv: Optional[str] = ""
+    card_holder_name: Optional[str] = ""
     account_email: Optional[str] = ""
     account_password: Optional[str] = ""
     cookies_json: Optional[str] = ""
+
+class AutobuyTestReq(BaseModel):
+    target_url: str
+    product_name: Optional[str] = "測試商品"
 
 class AddScheduledTaskReq(BaseModel):
     title: str
@@ -718,8 +731,16 @@ def api_update_config(req: UpdateConfigReq):
 def api_get_autobuy():
     cfg = load_autobuy_config()
     cookies = load_saved_cookies()
+    masked = get_masked_card_info(cfg)
     return {
-        "config": cfg,
+        "config": {
+            "enabled": cfg.get("enabled", False),
+            "auto_checkout": cfg.get("auto_checkout", False),
+            "auto_submit_payment": cfg.get("auto_submit_payment", False),
+            "payment_method": cfg.get("payment_method", "stored_card"),
+            "account_email": cfg.get("account_email", ""),
+        },
+        "card_info": masked,
         "has_cookies": bool(cookies),
         "cookie_count": len(cookies),
     }
@@ -729,6 +750,25 @@ def api_update_autobuy(req: UpdateAutobuyReq):
     cfg = load_autobuy_config()
     cfg["enabled"] = req.enabled
     cfg["auto_checkout"] = req.auto_checkout
+    cfg["auto_submit_payment"] = req.auto_submit_payment or False
+    if req.payment_method:
+        cfg["payment_method"] = req.payment_method
+
+    if "card_info" not in cfg or not isinstance(cfg["card_info"], dict):
+        cfg["card_info"] = {}
+
+    # 若有更新信用卡號（非空且不為掩碼）
+    if req.card_number and "*" not in req.card_number:
+        cfg["card_info"]["card_number"] = req.card_number.replace(" ", "").replace("-", "")
+    if req.card_exp_month:
+        cfg["card_info"]["card_exp_month"] = req.card_exp_month.strip()
+    if req.card_exp_year:
+        cfg["card_info"]["card_exp_year"] = req.card_exp_year.strip()
+    if req.card_cvv and "*" not in req.card_cvv:
+        cfg["card_info"]["card_cvv"] = req.card_cvv.strip()
+    if req.card_holder_name:
+        cfg["card_info"]["card_holder_name"] = req.card_holder_name.strip()
+
     if req.account_email:
         cfg["account_email"] = req.account_email.strip()
     if req.account_password:
@@ -749,7 +789,22 @@ def api_update_autobuy(req: UpdateAutobuyReq):
         except Exception as e:
             return JSONResponse({"success": False, "message": f"Cookie 格式錯誤: {e}"}, status_code=400)
 
-    return {"success": True, "config": cfg}
+    return {"success": True, "config": cfg, "card_info": get_masked_card_info(cfg)}
+
+# 自動加車與結帳沙盒測試 API
+@app.post("/api/autobuy/test")
+async def api_test_autobuy(req: AutobuyTestReq):
+    url = req.target_url.strip()
+    if not url.startswith("http"):
+        return JSONResponse({"success": False, "message": "請輸入有效商品網址！"}, status_code=400)
+    res = await execute_autobuy_flow(url, req.product_name or "測試商品", is_test_run=True)
+    return {"success": True, "result": res}
+
+# AI 除錯診斷報告導出 API
+@app.get("/api/autobuy/debug_report")
+def api_get_debug_report():
+    report_markdown = get_last_diagnostic_export()
+    return {"success": True, "report_markdown": report_markdown}
 
 # 預約任務 API
 @app.get("/api/scheduled_tasks")
@@ -966,15 +1021,76 @@ HTML_DASHBOARD = """<!DOCTYPE html>
               </div>
               <small class="text-muted d-block mb-3">加車後自動推進至最後付款確認頁面，為您省下所有排隊步驟。</small>
 
+              <!-- 付款方式選擇 -->
+              <div class="mb-3">
+                <label class="form-label small fw-bold mb-1">💳 結帳付款方式</label>
+                <select id="cfgPaymentMethod" class="form-select form-select-sm" onchange="togglePaymentInputs()">
+                  <option value="stored_card">使用帳戶已存預設信用卡 (最安全快速)</option>
+                  <option value="custom_card">預先輸入信用卡卡號與資訊</option>
+                  <option value="cod">貨到付款 / 超商取貨付款</option>
+                </select>
+              </div>
+
+              <!-- 自訂信用卡欄位區塊 (折疊式) -->
+              <div id="creditCardSection" class="p-3 mb-3 bg-light rounded-3 border" style="display: none;">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                  <span class="small fw-bold text-dark"><i class="bi bi-credit-card-2-front text-primary me-1"></i>信用卡安全預填</span>
+                  <span class="badge bg-secondary" id="cardStatusBadge">未填寫</span>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label small mb-0">卡號 (16 碼)</label>
+                  <input type="text" id="cfgCardNumber" class="form-control form-control-sm" placeholder="4123 4567 8901 2345" autocomplete="off">
+                </div>
+                <div class="row g-2 mb-2">
+                  <div class="col-4">
+                    <label class="form-label small mb-0">月份 (MM)</label>
+                    <input type="text" id="cfgCardExpMonth" class="form-control form-control-sm" placeholder="08" maxlength="2">
+                  </div>
+                  <div class="col-4">
+                    <label class="form-label small mb-0">年份 (YY)</label>
+                    <input type="text" id="cfgCardExpYear" class="form-control form-control-sm" placeholder="28" maxlength="4">
+                  </div>
+                  <div class="col-4">
+                    <label class="form-label small mb-0">安全碼(CVV)</label>
+                    <input type="password" id="cfgCardCvv" class="form-control form-control-sm" placeholder="123" maxlength="4" autocomplete="off">
+                  </div>
+                </div>
+                <div class="mb-1">
+                  <label class="form-label small mb-0">持卡人姓名 (英文拼音/中文)</label>
+                  <input type="text" id="cfgCardHolder" class="form-control form-control-sm" placeholder="例: WANG XIAO MING">
+                </div>
+                <small class="text-muted d-block" style="font-size: 0.72rem;">🔒 僅保存在您本機設定檔並受 .gitignore 保護，絕不推送到雲端或外流。</small>
+              </div>
+
+              <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="cfgAutoSubmitPayment">
+                <label class="form-check-label small fw-bold text-danger" for="cfgAutoSubmitPayment">⚡ 自動確認最終扣款下單 (高敏感)</label>
+                <small class="text-muted d-block" style="font-size: 0.75rem;">關閉時將停在最後授權頁等您確認；開啟則直接代您按下完成購買。</small>
+              </div>
+
               <div class="mb-3">
                 <label class="form-label small fw-bold mb-1">電商登入 Cookie (推薦貼上 Cookie JSON)</label>
                 <textarea id="cfgCookiesJson" rows="2" class="form-control form-control-sm" placeholder='可透過瀏覽器擴充套件導出 Cookie JSON 貼於此處'></textarea>
                 <div class="small text-success mt-1" id="cookieStatusText"></div>
               </div>
 
-              <button class="btn btn-warning w-100 fw-bold py-2" onclick="saveAutobuyConfig()">
-                <i class="bi bi-save me-1"></i>儲存搶購模組設定
-              </button>
+              <div class="d-flex gap-2 mb-3">
+                <button class="btn btn-warning flex-grow-1 fw-bold py-2" onclick="saveAutobuyConfig()">
+                  <i class="bi bi-save me-1"></i>儲存搶購模組設定
+                </button>
+              </div>
+
+              <!-- 測試試跑按鈕與 AI 除錯報告導出 -->
+              <div class="border-top pt-3">
+                <div class="d-flex gap-2">
+                  <button class="btn btn-outline-primary btn-sm flex-grow-1 fw-bold" onclick="openTestModal()">
+                    <i class="bi bi-play-circle me-1"></i>🧪 試跑加車與結帳
+                  </button>
+                  <button class="btn btn-outline-secondary btn-sm fw-bold" onclick="copyAiDebugReport()">
+                    <i class="bi bi-robot me-1"></i>📋 複製 AI 除錯報告
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -1167,6 +1283,81 @@ HTML_DASHBOARD = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ======================= 測試試跑視窗 (Modal) ======================= -->
+<div class="modal fade" id="modalAutobuyTest" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content rounded-4 border-0 shadow">
+      <div class="modal-header bg-primary text-white">
+        <h5 class="modal-title fw-bold"><i class="bi bi-play-circle-fill me-2"></i>🧪 自動加車與結帳流水線沙盒試跑</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-4">
+        <p class="text-muted small">
+          此工具將為您模擬搶購引擎的每一個動作（Stage 1 載入 ➔ Stage 2 點擊加車 ➔ Stage 3 推進結帳 ➔ Stage 3.5 填入付款方式）。
+          <strong>預設為安全試跑模式，不會進行最後實際扣款！</strong>
+        </p>
+        <div class="mb-3">
+          <label class="form-label fw-bold">測試目標商品網址：</label>
+          <input type="url" id="testTargetUrl" class="form-control" placeholder="https://www.costco.com.tw/.../p/123456">
+        </div>
+        <div class="d-flex gap-2 mb-3">
+          <button class="btn btn-primary fw-bold px-4" id="btnRunTest" onclick="startAutobuyTest()">
+            <span id="testSpinner" class="spinner-border spinner-border-sm d-none me-1"></span>開始試跑測試
+          </button>
+          <button class="btn btn-outline-secondary" onclick="useFirstProductForTest()">
+            帶入清單第 1 件商品
+          </button>
+        </div>
+
+        <!-- 試跑日誌即時輸出面板 -->
+        <div class="card bg-dark text-light border-0 rounded-3 mb-3">
+          <div class="card-header bg-secondary bg-opacity-25 d-flex justify-content-between align-items-center py-2">
+            <span class="small fw-bold"><i class="bi bi-terminal-fill me-1 text-info"></i>執行日誌視窗 (Execution Logs)</span>
+            <span class="badge bg-primary" id="testStageBadge">等待開始</span>
+          </div>
+          <div class="card-body p-3" style="max-height: 280px; overflow-y: auto; font-family: monospace; font-size: 0.85rem;" id="testLogContainer">
+            <div class="text-muted">點擊「開始試跑測試」以觀察完整流水線執行...</div>
+          </div>
+        </div>
+
+        <div id="testResultAlert" class="alert d-none py-2 mb-0"></div>
+      </div>
+      <div class="modal-footer bg-light">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">關閉</button>
+        <button type="button" class="btn btn-outline-success fw-bold" onclick="copyAiDebugReport()">
+          <i class="bi bi-robot me-1"></i>📋 複製 AI 除錯報告
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ======================= AI 除錯診斷報告視窗 (Modal) ======================= -->
+<div class="modal fade" id="modalAiDebug" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content rounded-4 border-0 shadow">
+      <div class="modal-header bg-dark text-white">
+        <h5 class="modal-title fw-bold"><i class="bi bi-robot me-2 text-warning"></i>📋 AI 友善除錯診斷報告</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-4">
+        <p class="text-muted small">
+          遇上加車失敗、找不到按鈕、或登入過期時，點擊下方「複製報告」並直接貼給任何 AI (如 ChatGPT, Claude, Gemini)，AI 能立即針對日誌與 DOM 結構為您快速排除問題！
+        </p>
+        <div class="mb-3">
+          <textarea id="aiDebugReportText" class="form-control font-monospace small" rows="12" readonly></textarea>
+        </div>
+      </div>
+      <div class="modal-footer bg-light">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">關閉</button>
+        <button type="button" class="btn btn-primary fw-bold" onclick="doCopyAiText()">
+          <i class="bi bi-clipboard-check me-1"></i>點擊一鍵複製
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 let lastNotificationId = null;
@@ -1206,14 +1397,47 @@ async function loadConfig() {
   }
 }
 
-// 載入搶購模組設定
+// 切換自訂信用卡欄位展開/收合
+function togglePaymentInputs() {
+  const method = document.getElementById("cfgPaymentMethod").value;
+  const section = document.getElementById("creditCardSection");
+  section.style.display = (method === "custom_card") ? "block" : "none";
+}
+
+// 載入搶購與付款設定
 async function loadAutobuyConfig() {
   try {
     const res = await fetch("/api/autobuy");
     const data = await res.json();
     const cfg = data.config || {};
+    const card = data.card_info || {};
+
     document.getElementById("cfgAutobuyEnabled").checked = !!cfg.enabled;
     document.getElementById("cfgAutoCheckout").checked = !!cfg.auto_checkout;
+    document.getElementById("cfgAutoSubmitPayment").checked = !!cfg.auto_submit_payment;
+    
+    if (cfg.payment_method) {
+      document.getElementById("cfgPaymentMethod").value = cfg.payment_method;
+    }
+    togglePaymentInputs();
+
+    // 填入信用卡遮罩資訊
+    const cardBadge = document.getElementById("cardStatusBadge");
+    if (card.has_card_number) {
+      document.getElementById("cfgCardNumber").value = card.masked_card_number || "";
+      document.getElementById("cfgCardExpMonth").value = card.card_exp_month || "";
+      document.getElementById("cfgCardExpYear").value = card.card_exp_year || "";
+      document.getElementById("cfgCardHolder").value = card.card_holder_name || "";
+      if (card.has_cvv) {
+        document.getElementById("cfgCardCvv").value = "***";
+      }
+      cardBadge.innerText = "已設定 ✅";
+      cardBadge.className = "badge bg-success";
+    } else {
+      cardBadge.innerText = "未填寫";
+      cardBadge.className = "badge bg-secondary";
+    }
+
     const cookieText = document.getElementById("cookieStatusText");
     if (data.has_cookies) {
       cookieText.innerText = "✅ 本地已載入 " + data.cookie_count + " 個 Cookie 憑證！";
@@ -1229,6 +1453,13 @@ async function saveAutobuyConfig() {
   const payload = {
     enabled: document.getElementById("cfgAutobuyEnabled").checked,
     auto_checkout: document.getElementById("cfgAutoCheckout").checked,
+    auto_submit_payment: document.getElementById("cfgAutoSubmitPayment").checked,
+    payment_method: document.getElementById("cfgPaymentMethod").value,
+    card_number: document.getElementById("cfgCardNumber").value.trim(),
+    card_exp_month: document.getElementById("cfgCardExpMonth").value.trim(),
+    card_exp_year: document.getElementById("cfgCardExpYear").value.trim(),
+    card_cvv: document.getElementById("cfgCardCvv").value.trim(),
+    card_holder_name: document.getElementById("cfgCardHolder").value.trim(),
     cookies_json: document.getElementById("cfgCookiesJson").value.trim()
   };
   try {
@@ -1238,7 +1469,7 @@ async function saveAutobuyConfig() {
       body: JSON.stringify(payload)
     });
     if (res.ok) {
-      alert("✅ 自動加車與搶購模組設定已更新！");
+      alert("✅ 自動加車、付款與搶購模組設定已更新！");
       document.getElementById("cfgCookiesJson").value = "";
       loadAutobuyConfig();
     } else {
@@ -1248,6 +1479,110 @@ async function saveAutobuyConfig() {
   } catch (e) {
     alert("❌ 儲存失敗: " + e);
   }
+}
+
+// ======================== 測試試跑與 AI 除錯 ========================
+function openTestModal() {
+  const modal = new bootstrap.Modal(document.getElementById("modalAutobuyTest"));
+  modal.show();
+}
+
+function useFirstProductForTest() {
+  const firstItem = document.querySelector("#productList a[href]");
+  if (firstItem && firstItem.href) {
+    document.getElementById("testTargetUrl").value = firstItem.href;
+  } else {
+    alert("目前清單中尚無商品，請在輸入框貼上商品網址。");
+  }
+}
+
+async function startAutobuyTest() {
+  const url = document.getElementById("testTargetUrl").value.trim();
+  if (!url) {
+    alert("請輸入欲測試之商品網址！");
+    return;
+  }
+  const btn = document.getElementById("btnRunTest");
+  const spinner = document.getElementById("testSpinner");
+  const logBox = document.getElementById("testLogContainer");
+  const badge = document.getElementById("testStageBadge");
+  const alertBox = document.getElementById("testResultAlert");
+
+  btn.disabled = true;
+  spinner.classList.remove("d-none");
+  badge.className = "badge bg-warning text-dark";
+  badge.innerText = "測試進行中...";
+  logBox.innerHTML = '<div class="text-info">⏳ 正在啟動沙盒測試引擎 (載入 Cookie / 瀏覽器模擬)...</div>';
+  alertBox.className = "alert d-none";
+
+  try {
+    const res = await fetch("/api/autobuy/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target_url: url, product_name: "沙盒測試商品" })
+    });
+    const data = await res.json();
+    if (res.ok && data.result) {
+      const r = data.result;
+      const diag = r.diagnostic || {};
+      const logs = diag.logs || [];
+
+      // 渲染即時日誌
+      let logHtml = "";
+      logs.forEach(l => {
+        let colorClass = "text-light";
+        if (l.status === "SUCCESS" || l.status === "APPLIED") colorClass = "text-success";
+        else if (l.status === "START" || l.status === "CLICK") colorClass = "text-info";
+        else if (l.status === "FAILED" || l.status === "ERROR") colorClass = "text-danger";
+        else if (l.status === "WARNING" || l.status === "PROTECTED") colorClass = "text-warning";
+
+        logHtml += `<div><span class="text-muted">[${l.time}]</span> <span class="fw-bold">[${l.step}]</span> <span class="${colorClass}">${l.status}</span>: ${l.detail}</div>`;
+      });
+      logBox.innerHTML = logHtml || '<div class="text-muted">測試完畢，無詳細日誌。</div>';
+
+      badge.innerText = "Stage " + (r.stage_reached || 0) + " 完成";
+      badge.className = r.stage_reached >= 3 ? "badge bg-success" : "badge bg-warning text-dark";
+
+      alertBox.className = r.stage_reached >= 3 ? "alert alert-success py-2 mb-0" : "alert alert-warning py-2 mb-0";
+      alertBox.innerHTML = `<strong>測試成果：</strong> ${r.status_title || ''} <br><small>${r.status_message || ''}</small>`;
+      alertBox.classList.remove("d-none");
+    } else {
+      logBox.innerHTML += `<div class="text-danger mt-2">❌ 測試失敗: ${(data.message || '未知錯誤')}</div>`;
+      badge.innerText = "測試失敗";
+      badge.className = "badge bg-danger";
+    }
+  } catch (e) {
+    logBox.innerHTML += `<div class="text-danger mt-2">❌ 請求異常: ${e}</div>`;
+    badge.innerText = "請求異常";
+    badge.className = "badge bg-danger";
+  } finally {
+    btn.disabled = false;
+    spinner.classList.add("d-none");
+  }
+}
+
+async function copyAiDebugReport() {
+  try {
+    const res = await fetch("/api/autobuy/debug_report");
+    const data = await res.json();
+    if (data.report_markdown) {
+      document.getElementById("aiDebugReportText").value = data.report_markdown;
+      const modal = new bootstrap.Modal(document.getElementById("modalAiDebug"));
+      modal.show();
+    }
+  } catch (e) {
+    alert("讀取除錯報告失敗: " + e);
+  }
+}
+
+function doCopyAiText() {
+  const textarea = document.getElementById("aiDebugReportText");
+  textarea.select();
+  navigator.clipboard.writeText(textarea.value).then(() => {
+    alert("✅ AI 除錯報告已複製到剪貼簿！您可以直接貼給 AI 進行分析！");
+  }).catch(e => {
+    alert("複製失敗，請手動複製文字框內容。");
+  });
 }
 
 async function saveConfig() {
