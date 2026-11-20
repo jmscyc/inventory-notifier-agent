@@ -392,11 +392,33 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
     now_ts = time.time()
     now_str = datetime.datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-    add_or_update_item(name=crawl_res.get("title") or name, target_url=target_url, in_stock=in_stock, status_notes=status_desc, item_id=item_id)
+    curr_p = crawl_res.get("price", "")
+    p_opt = item.get("preferred_option", "")
+    t_price = item.get("target_price")
+
+    add_or_update_item(
+        name=crawl_res.get("title") or name,
+        target_url=target_url,
+        in_stock=in_stock,
+        status_notes=status_desc,
+        item_id=item_id,
+        preferred_option=p_opt,
+        current_price=curr_p
+    )
 
     state = NOTIFY_STATE.get(item_id, {"last_notified_stock": None, "last_notified_time": 0})
     last_notified_stock = state.get("last_notified_stock")
     last_notified_time = state.get("last_notified_time", 0)
+
+    # 檢查目標預算上限：若有設定 target_price 且當前價格高於預算，暫不觸發搶購/通知
+    price_fits_budget = True
+    if t_price and curr_p:
+        try:
+            num_str = re.sub(r"[^\d.]", "", curr_p)
+            if num_str and float(num_str) > float(t_price):
+                price_fits_budget = False
+        except Exception:
+            pass
 
     should_send = False
     notify_title = ""
@@ -409,12 +431,15 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
 
     if is_manual:
         should_send = True
-        if in_stock:
-            flow_res = await execute_autobuy_flow(target_url, name)
+        if in_stock and price_fits_budget:
+            flow_res = await execute_autobuy_flow(target_url, name, preferred_option=p_opt)
             notify_title = flow_res["status_title"]
             notify_body = flow_res["status_message"]
             action_url = flow_res["action_url"]
             btn_text = flow_res["action_button_text"]
+        elif in_stock and not price_fits_budget:
+            notify_title = "💰 **【商品已補貨，但高於您的心理預算】**"
+            notify_body = f"📦 **商品**：{name}\n🟢 有現貨！但售價為 `{curr_p}`，高於預算上限 `${t_price}` 元。"
         else:
             notify_title = "ℹ️ **【手動更新：目前依然缺貨中】**"
             notify_body = f"📦 **商品**：{name}\n🔴 目前狀態：{status_desc}\n系統維持每 {poll_interval} 分鐘自動監控！"
@@ -423,11 +448,10 @@ async def perform_check_and_notify_single(client: Optional[httpx.AsyncClient], i
             NOTIFY_STATE[item_id] = {"last_notified_stock": last_notified_stock, "last_notified_time": last_notified_time}
             return
 
-        if in_stock:
-            # 有貨：若先前是缺貨、未曾通知，或者距離上次有貨通知超過 15 分鐘，持續提醒有現貨！
+        if in_stock and price_fits_budget:
+            # 有貨且符合預算：若先前是缺貨、未曾通知，或者距離上次有貨通知超過 15 分鐘，持續提醒有現貨！
             if (last_notified_stock is not True) or (now_ts - last_notified_time >= 900):
                 should_send = True
-                p_opt = item.get("preferred_option", "")
                 flow_res = await execute_autobuy_flow(target_url, name, preferred_option=p_opt)
                 notify_title = flow_res["status_title"]
                 notify_body = flow_res["status_message"]

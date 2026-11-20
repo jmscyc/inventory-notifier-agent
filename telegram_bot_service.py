@@ -18,6 +18,7 @@ from typing import Dict, Any, List
 
 import httpx
 from bs4 import BeautifulSoup
+from run_local_app import check_product_inventory
 
 try:
     import zoneinfo
@@ -191,25 +192,27 @@ async def handle_text_command(client: httpx.AsyncClient, chat_id: str, text: str
         res_text = "🏁 **【立即檢查最新結果】**\n\n"
         any_in_stock_btns = []
         for p in products:
-            p_url = p.get("url")
+            p_url = p.get("url") or p.get("target_url")
             p_name = p.get("name", p_url)
             p_id = str(p.get("id"))
             try:
-                r = await client.get(p_url, headers=headers, timeout=10.0)
-                soup = BeautifulSoup(r.text, "html.parser")
-                costco_oos_btn = soup.find(lambda t: t.name == "button" and ("outOfStock" in t.get("class", []) or "缺貨" in t.get_text()))
-                costco_pdp_add_btn = soup.find("button", id="add-to-cart-button")
-                in_stock = bool(costco_pdp_add_btn and not costco_oos_btn)
+                crawl_res = await asyncio.to_thread(check_product_inventory, p_url)
+                in_stock = crawl_res.get("in_stock", False)
                 st = "🟢 有現貨！" if in_stock else "🔴 缺貨中"
                 p["last_status"] = st
-                res_text += f"• **{p_name}**：`{st}`\n"
+                p["in_stock"] = in_stock
+                curr_price = crawl_res.get("price", "")
+                if curr_price:
+                    p["current_price"] = curr_price
+                price_str = f" (`{curr_price}`)" if curr_price else ""
+                res_text += f"• **{p_name}**：`{st}`{price_str}\n"
                 if in_stock:
                     any_in_stock_btns.append([
                         {"text": f"⚡ 遠端代搶: {p_name[:12]}", "callback_data": f"buy_{p_id}"},
                         {"text": "🛒 手動頁面", "url": p_url}
                     ])
-            except Exception:
-                res_text += f"• **{p_name}**：`抓取失敗`\n"
+            except Exception as e:
+                res_text += f"• **{p_name}**：`抓取失敗 ({e})`\n"
 
         save_data(settings, products)
         if any_in_stock_btns:
