@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>庫存監控與自動化工作台 - GitHub 雲端版</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    @keyframes pulse-slow { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+    .animate-pulse-slow { animation: pulse-slow 2.5s infinite ease-in-out; }
+  </style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col font-sans">
+  <!-- 頂部導航 -->
+  <header class="bg-slate-800/80 backdrop-blur border-b border-slate-700/60 sticky top-0 z-50">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+      <div class="flex items-center space-x-3">
+        <span class="text-2xl">🛒</span>
+        <div>
+          <h1 class="font-bold text-lg text-white leading-tight">好市多庫存監控雲端控制台</h1>
+          <p class="text-xs text-emerald-400 flex items-center gap-1.5">
+            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+            GitHub Actions 24/7 雲端巡檢中 (100% 免費·免綁信用卡)
+          </p>
+        </div>
+      </div>
+      <div class="flex items-center space-x-3 text-xs">
+        <a id="ghActionsLink" href="https://github.com/jmscyc/inventory-notifier-agent/actions" target="_blank" 
+           class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg flex items-center gap-1.5 transition shadow">
+          <i class="fab fa-github"></i> 雲端執行日誌
+        </a>
+        <a href="https://t.me/jmsaitry_bot" target="_blank" 
+           class="px-3 py-1.5 bg-sky-500 hover:bg-sky-400 text-white rounded-lg flex items-center gap-1.5 transition shadow">
+          <i class="fab fa-telegram-plane"></i> 打開 Telegram
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6 flex-1 w-full space-y-6">
+    <!-- 雲端巡檢狀態卡片 -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="bg-slate-800/90 border border-slate-700/70 p-4 rounded-xl flex items-center space-x-4">
+        <div class="p-3 bg-emerald-500/20 text-emerald-400 rounded-lg text-xl">
+          <i class="fas fa-satellite-dish"></i>
+        </div>
+        <div>
+          <p class="text-xs text-slate-400">雲端巡檢狀態</p>
+          <p class="text-base font-bold text-emerald-400 flex items-center gap-1.5">
+            全自動運作中 <span class="text-xs px-2 py-0.5 bg-emerald-900/60 rounded border border-emerald-500/30">每 15 分鐘</span>
+          </p>
+        </div>
+      </div>
+
+      <div class="bg-slate-800/90 border border-slate-700/70 p-4 rounded-xl flex items-center space-x-4">
+        <div class="p-3 bg-indigo-500/20 text-indigo-400 rounded-lg text-xl">
+          <i class="fas fa-boxes-stacked"></i>
+        </div>
+        <div>
+          <p class="text-xs text-slate-400">目前監控商品數</p>
+          <p id="totalProductsCount" class="text-base font-bold text-white">載入中...</p>
+        </div>
+      </div>
+
+      <div class="bg-slate-800/90 border border-slate-700/70 p-4 rounded-xl flex items-center space-x-4">
+        <div class="p-3 bg-sky-500/20 text-sky-400 rounded-lg text-xl">
+          <i class="fas fa-bell"></i>
+        </div>
+        <div>
+          <p class="text-xs text-slate-400">即時推播頻道</p>
+          <p class="text-base font-bold text-sky-400">Telegram 直送手機</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新增商品與操作區 -->
+    <div class="bg-slate-800/90 border border-slate-700/70 p-5 rounded-xl shadow-lg">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+        <div>
+          <h2 class="text-base font-bold text-white flex items-center gap-2">
+            <i class="fas fa-cart-plus text-amber-400"></i> 新增商品監控
+          </h2>
+          <p class="text-xs text-slate-400 mt-0.5">貼上 Costco 好市多線上購物商品網址即可納入雲端排程</p>
+        </div>
+        <div class="flex gap-2">
+          <button id="btnTriggerNow" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow">
+            <i class="fas fa-play"></i> 立即觸發雲端檢查
+          </button>
+        </div>
+      </div>
+
+      <div class="flex flex-col sm:flex-row gap-3">
+        <input type="url" id="inputProductUrl" placeholder="例如：https://www.costco.com.tw/p/142997" 
+               class="flex-1 px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
+        <button id="btnAddProduct" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-semibold transition flex items-center justify-center gap-2 shadow">
+          <i class="fas fa-plus"></i> 加入監控清單
+        </button>
+      </div>
+
+      <!-- GitHub Token 說明 (只需一次輸入即可在網頁直接寫入 GitHub) -->
+      <div class="mt-4 pt-3 border-t border-slate-700/50 flex flex-col sm:flex-row items-start sm:items-center justify-between text-xs text-slate-400 gap-2">
+        <div class="flex items-center gap-1.5">
+          <i class="fas fa-key text-amber-400"></i>
+          <span>GitHub 個人授權碼 (可選，填入後可在本網頁直接新增商品與點擊立即檢查):</span>
+        </div>
+        <div class="flex gap-2 w-full sm:w-auto">
+          <input type="password" id="inputGhToken" placeholder="GitHub PAT (預設自動記住)" 
+                 class="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-xs text-slate-200 focus:outline-none w-full sm:w-48">
+          <button id="btnSaveToken" class="px-2.5 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white">記住</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 追蹤商品列表 -->
+    <div class="bg-slate-800/90 border border-slate-700/70 p-5 rounded-xl shadow-lg space-y-4">
+      <div class="flex items-center justify-between border-b border-slate-700/60 pb-3">
+        <h2 class="text-base font-bold text-white flex items-center gap-2">
+          <i class="fas fa-list-check text-indigo-400"></i> 監控中商品清單
+        </h2>
+        <button id="btnRefreshList" class="text-xs text-slate-400 hover:text-white flex items-center gap-1">
+          <i class="fas fa-rotate"></i> 重新載入清單
+        </button>
+      </div>
+
+      <div id="productsContainer" class="space-y-3">
+        <!-- 動態渲染卡片 -->
+      </div>
+    </div>
+
+    <!-- Telegram 快速使用指引 -->
+    <div class="bg-gradient-to-r from-sky-900/30 to-indigo-900/30 border border-sky-700/40 p-4 rounded-xl text-xs space-y-2">
+      <p class="font-bold text-sky-300 flex items-center gap-2">
+        <i class="fab fa-telegram text-sky-400 text-sm"></i> 💡 免開網頁！手機 Telegram 也能隨傳隨新增：
+      </p>
+      <p class="text-slate-300 leading-relaxed">
+        在外用手機看到想追蹤的好市多商品，直接將商品網址複製並傳送給您的機器人 
+        <a href="https://t.me/jmsaitry_bot" target="_blank" class="text-sky-400 underline font-bold">@jmsaitry_bot</a>，機器人會立即幫您記錄並排入雲端每 15 分鐘巡檢！
+      </p>
+    </div>
+  </main>
+
+  <!-- 提示彈窗 -->
+  <div id="toast" class="fixed bottom-5 right-5 bg-slate-800 border border-slate-700 text-white text-xs px-4 py-3 rounded-lg shadow-xl hidden transition-all duration-300 z-50"></div>
+
+  <script>
+    const REPO_OWNER = 'jmscyc';
+    const REPO_NAME = 'inventory-notifier-agent';
+    const RAW_PRODUCTS_URL = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/tracked_products.json?t=${Date.now()}`;
+    const GH_API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
+
+    let currentProducts = [];
+
+    function showToast(msg, isSuccess = true) {
+      const toast = document.getElementById('toast');
+      toast.innerHTML = `<span class="${isSuccess ? 'text-emerald-400' : 'text-rose-400'} mr-2">●</span> ${msg}`;
+      toast.classList.remove('hidden');
+      setTimeout(() => toast.classList.add('hidden'), 4000);
+    }
+
+    async function fetchProducts() {
+      try {
+        const resp = await fetch(RAW_PRODUCTS_URL);
+        if (!resp.ok) throw new Error("讀取清單失敗");
+        currentProducts = await resp.json();
+        renderProducts(currentProducts);
+      } catch (e) {
+        document.getElementById('productsContainer').innerHTML = `
+          <div class="p-6 text-center text-slate-400 text-xs">
+            讀取商品清單失敗或清單為空。請稍候再試。
+          </div>
+        `;
+      }
+    }
+
+    function renderProducts(items) {
+      const container = document.getElementById('productsContainer');
+      document.getElementById('totalProductsCount').innerText = `${items.length} 件`;
+
+      if (!items || items.length === 0) {
+        container.innerHTML = `
+          <div class="p-8 text-center text-slate-400 text-xs bg-slate-900/50 rounded-lg">
+            目前尚未加入任何商品。請在上方輸入框輸入 Costco 網址新增！
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = items.map((item, index) => {
+        const inStock = item.in_stock;
+        return `
+          <div class="p-4 bg-slate-900/80 border ${inStock ? 'border-emerald-500/60 bg-emerald-950/20' : 'border-slate-700/60'} rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4 transition hover:border-slate-600">
+            <div class="space-y-1.5 flex-1">
+              <div class="flex items-center gap-2">
+                <span class="px-2 py-0.5 rounded text-xs font-bold ${inStock ? 'bg-emerald-600 text-white' : 'bg-slate-700 text-slate-300'}">
+                  ${inStock ? '🟢 有現貨' : '🔴 目前缺貨'}
+                </span>
+                <h3 class="text-sm font-semibold text-white line-clamp-1">${item.name || '商品名稱讀取中'}</h3>
+              </div>
+              <p class="text-xs text-slate-400 break-all">
+                <span class="text-slate-500">網址：</span><a href="${item.target_url}" target="_blank" class="text-indigo-400 hover:underline">${item.target_url}</a>
+              </p>
+              <div class="flex items-center gap-3 text-xs text-slate-500">
+                <span>狀態：${item.status_notes || '巡檢中'}</span>
+                <span>•</span>
+                <span>上次巡檢：${item.last_checked || '等待排程'}</span>
+              </div>
+            </div>
+            <div class="flex items-center gap-2 self-end md:self-center">
+              <a href="${item.target_url}" target="_blank" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-medium transition border border-slate-700">
+                <i class="fas fa-external-link-alt"></i> 前往商品
+              </a>
+              <button onclick="removeProduct('${item.id || index}')" class="px-3 py-1.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 rounded-lg text-xs font-medium transition border border-rose-500/30">
+                <i class="fas fa-trash-can"></i> 移除
+              </button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function removeProduct(id) {
+      const token = localStorage.getItem('gh_token') || document.getElementById('inputGhToken').value.trim();
+      if (!token) {
+        alert("請在下方填入您的 GitHub Token 才能直接在網頁修改儲存庫；或者直接在 GitHub 網頁編輯 tracked_products.json！");
+        return;
+      }
+      if (!confirm("確定要停止監控此商品嗎？")) return;
+
+      const filtered = currentProducts.filter(it => it.id !== id);
+      await commitUpdatedProducts(filtered, token, `Remove product ${id}`);
+    }
+
+    async function commitUpdatedProducts(newItems, token, commitMsg) {
+      try {
+        showToast("正在同步至 GitHub 雲端...", true);
+        // 先取得目前的 sha
+        const getFileResp = await fetch(`${GH_API_URL}/contents/tracked_products.json`, {
+          headers: { 'Authorization': `token ${token}` }
+        });
+        const fileData = await getFileResp.json();
+        const sha = fileData.sha;
+
+        const contentBase64 = btoa(unescape(encodeURIComponent(JSON.stringify(newItems, null, 2))));
+        const putResp = await fetch(`${GH_API_URL}/contents/tracked_products.json`, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `token ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            message: commitMsg,
+            content: contentBase64,
+            sha: sha
+          })
+        });
+
+        if (putResp.ok) {
+          showToast("✅ 成功更新至 GitHub！下次排程將生效", true);
+          currentProducts = newItems;
+          renderProducts(currentProducts);
+        } else {
+          throw new Error("更新失敗，請檢查 Token 權限！");
+        }
+      } catch (e) {
+        showToast(`❌ ${e.message}`, false);
+      }
+    }
+
+    document.getElementById('btnAddProduct').addEventListener('click', async () => {
+      const url = document.getElementById('inputProductUrl').value.trim();
+      if (!url.startsWith('http')) {
+        alert("請輸入有效的商品網址！");
+        return;
+      }
+
+      const token = localStorage.getItem('gh_token') || document.getElementById('inputGhToken').value.trim();
+      if (!token) {
+        // 如果沒有 token，引導使用者直接跳轉到 GitHub 編輯
+        window.open(`https://github.com/${REPO_OWNER}/${REPO_NAME}/edit/main/tracked_products.json`, '_blank');
+        return;
+      }
+
+      const matchCode = url.match(/\/p\/(\d+)/);
+      const code = matchCode ? matchCode[1] : Date.now();
+      const newItem = {
+        id: `item-${code}`,
+        name: `好市多商品 (${code})`,
+        target_url: url,
+        in_stock: false,
+        status_notes: "新加入待巡檢",
+        last_checked: ""
+      };
+
+      const updated = [...currentProducts, newItem];
+      await commitUpdatedProducts(updated, token, `Add new product ${code}`);
+      document.getElementById('inputProductUrl').value = '';
+    });
+
+    document.getElementById('btnTriggerNow').addEventListener('click', async () => {
+      const token = localStorage.getItem('gh_token') || document.getElementById('inputGhToken').value.trim();
+      if (!token) {
+        window.open(`https://github.com/${REPO_OWNER}/${REPO_NAME}/actions/workflows/inventory_monitor.yml`, '_blank');
+        return;
+      }
+      try {
+        showToast("正在喚醒 GitHub 雲端執行立即巡檢...", true);
+        const resp = await fetch(`${GH_API_URL}/actions/workflows/inventory_monitor.yml/dispatches`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `token ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ ref: 'main' })
+        });
+        if (resp.status === 204) {
+          showToast("🎉 雲端機器人已啟動！10 秒後檢查 Telegram！", true);
+        } else {
+          throw new Error("觸發失敗");
+        }
+      } catch (e) {
+        showToast("觸發失敗，請檢查 Token 或直接在 GitHub 網頁點選 Run workflow", false);
+      }
+    });
+
+    document.getElementById('btnSaveToken').addEventListener('click', () => {
+      const val = document.getElementById('inputGhToken').value.trim();
+      if (val) {
+        localStorage.setItem('gh_token', val);
+        showToast("已成功記住 GitHub Token！", true);
+      }
+    });
+
+    document.getElementById('btnRefreshList').addEventListener('click', () => {
+      fetchProducts();
+      showToast("清單已重新整理", true);
+    });
+
+    // 初始化
+    const saved = localStorage.getItem('gh_token');
+    if (saved) document.getElementById('inputGhToken').value = saved;
+    fetchProducts();
+  </script>
+</body>
+</html>
