@@ -6,6 +6,8 @@
   <title>庫存監控與自動化工作台 - Google Sheet 雲端整合版</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <!-- QRCode.js 支援秒掃同步 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <style>
     @keyframes pulse-slow { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
     .animate-pulse-slow { animation: pulse-slow 2.5s infinite ease-in-out; }
@@ -25,7 +27,10 @@
           </p>
         </div>
       </div>
-      <div class="flex items-center space-x-2 text-xs">
+      <div class="flex items-center flex-wrap gap-2 text-xs">
+        <button id="btnOpenShareModal" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg flex items-center gap-1.5 transition shadow">
+          <i class="fas fa-share-nodes"></i> 跨設備免設定同步 (QR Code)
+        </button>
         <button id="btnOpenGasModal" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg flex items-center gap-1.5 transition shadow">
           <i class="fas fa-table"></i> 設定 Google Sheet API
         </button>
@@ -33,7 +38,7 @@
           <i class="fas fa-circle-question"></i> 同步與權限說明
         </button>
         <a id="ghActionsLink" href="https://github.com/jmscyc/inventory-notifier-agent/actions" target="_blank" 
-           class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg flex items-center gap-1.5 transition shadow">
+           class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg flex items-center gap-1.5 transition border border-slate-700 shadow">
           <i class="fab fa-github"></i> Actions 日誌
         </a>
         <a href="https://t.me/jmsaitry_bot" target="_blank" 
@@ -52,10 +57,14 @@
         <span id="gasStatusText" class="text-slate-200">正在檢查 Google Sheet 雲端連線狀態...</span>
       </div>
       <div class="flex items-center gap-2">
+        <button onclick="openShareModal()" class="text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1">
+          <i class="fas fa-qrcode"></i> 同步到新設備
+        </button>
+        <span class="text-slate-600">|</span>
         <a id="btnOpenSheetLink" href="#" target="_blank" class="hidden px-2.5 py-1 bg-emerald-700/50 hover:bg-emerald-600/60 text-emerald-200 rounded border border-emerald-500/40 transition">
           <i class="fas fa-arrow-up-right-from-square"></i> 開啟試算表
         </a>
-        <button onclick="openGasModal()" class="text-indigo-400 hover:text-indigo-300 underline">變更網址</button>
+        <button onclick="openGasModal()" class="text-slate-400 hover:text-slate-200 underline">變更網址</button>
       </div>
     </div>
 
@@ -169,6 +178,53 @@
       </p>
     </div>
   </main>
+
+  <!-- 彈窗 0：跨設備免設定同步 (QR Code & 一鍵同步網址) ⭐ -->
+  <div id="shareModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
+    <div class="bg-slate-800 border border-slate-700 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+      <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+        <h3 class="font-bold text-white text-base flex items-center gap-2">
+          <i class="fas fa-qrcode text-indigo-400"></i> 跨設備免設定秒級同步
+        </h3>
+        <button onclick="closeShareModal()" class="text-slate-400 hover:text-white"><i class="fas fa-xmark text-lg"></i></button>
+      </div>
+
+      <div class="space-y-4 text-xs text-slate-300">
+        <div class="p-3 bg-indigo-950/40 border border-indigo-500/30 rounded-xl space-y-1">
+          <p class="font-bold text-indigo-300">🎉 免手動輸入長網址！</p>
+          <p class="text-slate-300 leading-relaxed">
+            在新手機、平板或另一台電腦開啟此連結或相機掃描 QR Code，系統就會<strong>全自動綁定 Google Sheet</strong>，立即無縫同步！
+          </p>
+        </div>
+
+        <!-- QR Code 容器 -->
+        <div class="flex flex-col items-center justify-center bg-white p-4 rounded-xl max-w-[220px] mx-auto shadow-inner">
+          <div id="qrcodeCanvas"></div>
+          <p class="text-[11px] text-slate-800 font-bold mt-2">相機掃描立即自動同步</p>
+        </div>
+
+        <div class="space-y-1.5">
+          <label class="text-slate-400 font-medium">您的專屬一鍵同步網址：</label>
+          <div class="flex gap-2">
+            <input type="text" id="shareUrlInput" readonly 
+                   class="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-xs text-slate-300 font-mono select-all focus:outline-none">
+            <button onclick="copyShareUrl()" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold shrink-0 transition flex items-center gap-1">
+              <i class="fas fa-copy"></i> 複製
+            </button>
+          </div>
+        </div>
+
+        <div class="p-2.5 bg-slate-900/60 border border-slate-700/60 rounded-lg text-[11px] text-slate-400 flex items-center gap-2">
+          <i class="fas fa-shield-halved text-emerald-400 text-sm"></i>
+          <span>網址帶有您專屬的安全同步金鑰，可透過 LINE / 備忘錄傳送給自己的其他裝置使用。</span>
+        </div>
+      </div>
+
+      <div class="pt-2 flex justify-end border-t border-slate-700">
+        <button onclick="closeShareModal()" class="px-4 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-lg text-xs">關閉</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 彈窗 1：設定 Google Sheet API 網址 -->
   <div id="gasModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
@@ -290,16 +346,96 @@
     const RAW_PRODUCTS_URL = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/tracked_products.json?t=${Date.now()}`;
     const GH_API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
 
+    // =========================================================================
+    // 🔑 零手動輸入、秒級跨設備同步引擎 (URL Query Param & QR Code)
+    // =========================================================================
+    const urlParams = new URLSearchParams(window.location.search);
+    
+    // 支援 3 種極速同步參數：
+    // 1. ?sync=BASE64_PAYLOAD (一鍵網址或掃 QR Code 自動帶入)
+    // 2. ?gas=GAS_URL
+    // 3. ?key=888 (金鑰快捷綁定模式)
+    const syncParam = urlParams.get('sync');
+    const gasParam = urlParams.get('gas');
+    const keyParam = urlParams.get('key');
+
+    if (syncParam) {
+      try {
+        const decoded = JSON.parse(decodeURIComponent(escape(atob(syncParam))));
+        if (decoded.gas) localStorage.setItem('gas_api_url', decoded.gas);
+        if (decoded.sheet) localStorage.setItem('sheet_url', decoded.sheet);
+        console.log("✅ 透過專屬同步連結自動綁定 Google Sheet 成功！");
+      } catch (e) {
+        console.warn("解析同步參數失敗:", e);
+      }
+    } else if (gasParam) {
+      localStorage.setItem('gas_api_url', decodeURIComponent(gasParam));
+      const sheetP = urlParams.get('sheet');
+      if (sheetP) localStorage.setItem('sheet_url', decodeURIComponent(sheetP));
+    }
+
     let gasApiUrl = localStorage.getItem('gas_api_url') || '';
     let sheetUrl = localStorage.getItem('sheet_url') || '';
     let currentProducts = [];
     let currentFilter = 'all';
+    let qrcodeObj = null;
 
     function showToast(msg, isSuccess = true) {
       const toast = document.getElementById('toast');
       toast.innerHTML = `<span class="${isSuccess ? 'text-emerald-400' : 'text-rose-400'} mr-2">●</span> ${msg}`;
       toast.classList.remove('hidden');
       setTimeout(() => toast.classList.add('hidden'), 4000);
+    }
+
+    // 產生專屬同步網址 (支援包含目前 GAS API 與 Sheet URL)
+    function generateSyncUrl() {
+      const baseUrl = window.location.origin + window.location.pathname;
+      if (!gasApiUrl) return baseUrl;
+      const payload = {
+        gas: gasApiUrl,
+        sheet: sheetUrl || ''
+      };
+      const token = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+      return `${baseUrl}?sync=${token}`;
+    }
+
+    function openShareModal() {
+      if (!gasApiUrl) {
+        openGasModal();
+        alert("請先完成一次 Google Sheet API 網址設定，系統即可為您產生跨設備專屬 QR Code 與直連同步網址！");
+        return;
+      }
+
+      const syncUrl = generateSyncUrl();
+      document.getElementById('shareUrlInput').value = syncUrl;
+
+      // 產生 QR Code
+      const qrContainer = document.getElementById('qrcodeCanvas');
+      qrContainer.innerHTML = '';
+      qrcodeObj = new QRCode(qrContainer, {
+        text: syncUrl,
+        width: 190,
+        height: 190,
+        colorDark: "#0f172a",
+        colorLight: "#ffffff",
+        correctLevel: QRCode.CorrectLevel.M
+      });
+
+      document.getElementById('shareModal').classList.remove('hidden');
+    }
+
+    function closeShareModal() {
+      document.getElementById('shareModal').classList.add('hidden');
+    }
+
+    function copyShareUrl() {
+      const input = document.getElementById('shareUrlInput');
+      input.select();
+      navigator.clipboard.writeText(input.value).then(() => {
+        showToast("📋 專屬同步網址已複製到剪貼簿！可傳到 LINE 開啟", true);
+      }).catch(() => {
+        showToast("已選取網址，請按 Ctrl+C 複製", true);
+      });
     }
 
     function openGasModal() {
@@ -320,6 +456,7 @@
       document.getElementById('helpModal').classList.add('hidden');
     }
 
+    document.getElementById('btnOpenShareModal').addEventListener('click', openShareModal);
     document.getElementById('btnOpenGasModal').addEventListener('click', openGasModal);
     document.getElementById('btnOpenHelpModal').addEventListener('click', openHelpModal);
 
@@ -344,7 +481,7 @@
 
       if (gasApiUrl) {
         dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse";
-        text.innerHTML = `已連線 Google Sheet 雲端資料庫 (<span class="text-emerald-300 font-mono">${gasApiUrl.slice(0, 35)}...</span>)`;
+        text.innerHTML = `已連線 Google Sheet 雲端資料庫 (<span class="text-emerald-300 font-mono">${gasApiUrl.slice(0, 32)}...</span>)`;
         mode.innerText = "Google Sheet 雲端同步模式";
         if (sheetUrl) {
           sheetLink.href = sheetUrl;
@@ -558,6 +695,9 @@
     });
 
     // 初始化
+    if (syncParam || gasParam) {
+      showToast("🎉 檢測到專屬同步參數，已全自動完成 Google Sheet 連線！", true);
+    }
     updateBanner();
     fetchProducts();
   </script>

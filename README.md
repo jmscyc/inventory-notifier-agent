@@ -127,6 +127,13 @@ uv run python3 telegram_bot_service.py
    - **地端本機版**：在 `.env` 中加入 `GOOGLE_SHEET_API_URL="您的_GAS_網址"`，本機新增/刪除商品會自動同步至試算表！
    - **GitHub 24/7 巡檢**：在 GitHub 儲存庫 `Settings` ➔ `Secrets and variables` ➔ `Actions` 新增 Secret 名稱為 `GOOGLE_SHEET_API_URL`，雲端巡檢將優先自 Google Sheet 抓取最新商品並回寫現貨狀態！
 
+### 📱 換手機/換平板如何一秒同步？（零手動輸入、專屬 QR Code / 一鍵直連）
+
+您不需要在每台裝置上手動輸入冗長的 Google 網址：
+1. 在您已綁定好的電腦或手機上，點擊頂部紫色按鈕 **「跨設備免設定同步 (QR Code)」**。
+2. **面對面掃碼**：另一台手機直接開啟相機掃描 QR Code，打開瞬間即**自動連線綁定**！
+3. **通訊軟體分享**：點擊「複製」，將專屬直連連結（如 `https://.../admin.html?sync=...`）傳送到自己的 LINE / Telegram / 備忘錄，在新設備點開即刻永久同步！
+
 ---
 
 ## 📂 檔案架構總覽 (File Structure)
