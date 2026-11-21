@@ -51,7 +51,12 @@ uv run python3 telegram_bot_service.py
 
 ### 📌 第二步：如何進入控制台介面？
 
-啟動成功後，打開任何網頁瀏覽器（Chrome、Edge、Safari 等），網址列輸入：
+#### 🌐 雲端線上網頁版 (免開電腦 / 手機隨時可開)：
+👉 **[https://jmscyc.github.io/inventory-notifier-agent/admin.html](https://jmscyc.github.io/inventory-notifier-agent/admin.html)**
+*(同時支援 `index.html` 與 `admin.html`，隨時由瀏覽器查看 24/7 巡檢狀態與監控商品！)*
+
+#### 💻 本地端完整控制台 (具備自動代搶/本機防休眠)：
+啟動成功後，打開任何網頁瀏覽器，網址列輸入：
 👉 **`http://localhost:8000`**
 
 您將看到功能齊全的視覺化控制台，包含：
