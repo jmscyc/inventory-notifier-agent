@@ -31,6 +31,40 @@ LAST_STATE_FILE = BASE_DIR / "last_check_status.json"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+GOOGLE_SHEET_API_URL = os.getenv("GOOGLE_SHEET_API_URL", "").strip()
+
+def sync_from_google_sheet() -> Optional[List[Dict[str, Any]]]:
+    """若設定了 GOOGLE_SHEET_API_URL，從 Google Sheet 優先同步最新商品清單"""
+    if not GOOGLE_SHEET_API_URL:
+        return None
+    try:
+        resp = httpx.get(f"{GOOGLE_SHEET_API_URL}?action=getItems&t={int(time.time())}", timeout=10.0, follow_redirects=True)
+        if resp.status_code == 200:
+            res_json = resp.json()
+            if res_json.get("success") and isinstance(res_json.get("items"), list):
+                print(f"✅ 成功自 Google Sheet 同步 {len(res_json['items'])} 件監控商品！")
+                return res_json["items"]
+    except Exception as e:
+        print(f"⚠️ 自 Google Sheet 同步失敗，降級使用本地 JSON: {e}")
+    return None
+
+def sync_to_google_sheet(product: Dict[str, Any], in_stock: bool, status_notes: str, current_price: str = ""):
+    """若設定了 GOOGLE_SHEET_API_URL，回寫單一商品最新狀態至 Google Sheet"""
+    if not GOOGLE_SHEET_API_URL:
+        return
+    try:
+        payload = {
+            "action": "updateStatus",
+            "id": product.get("id", ""),
+            "url": product.get("target_url") or product.get("url", ""),
+            "name": product.get("name", ""),
+            "in_stock": in_stock,
+            "status_notes": status_notes,
+            "current_price": current_price
+        }
+        httpx.post(GOOGLE_SHEET_API_URL, json=payload, timeout=8.0, follow_redirects=True)
+    except Exception as e:
+        print(f"⚠️ 回寫 Google Sheet 失敗: {e}")
 
 def load_config_and_products() -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     default_config = {
@@ -41,22 +75,32 @@ def load_config_and_products() -> Tuple[Dict[str, Any], List[Dict[str, Any]], Li
         "oos_periodic_notify_hours": 4,
         "telegram": {"enabled": True}
     }
-    if not DATA_FILE.exists():
-        return default_config, [], [], []
+    
+    settings = default_config
+    products = []
+    scheduled_tasks = []
+    custom_rules = []
 
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return default_config, data, [], []
-            settings = data.get("settings", default_config)
-            products = data.get("products", [])
-            scheduled_tasks = data.get("scheduled_tasks", [])
-            custom_rules = data.get("custom_rules", [])
-            return settings, products, scheduled_tasks, custom_rules
-    except Exception as e:
-        print(f"⚠️ 讀取 {DATA_FILE} 失敗: {e}")
-        return default_config, [], [], []
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    products = data
+                else:
+                    settings = data.get("settings", default_config)
+                    products = data.get("products", [])
+                    scheduled_tasks = data.get("scheduled_tasks", [])
+                    custom_rules = data.get("custom_rules", [])
+        except Exception as e:
+            print(f"⚠️ 讀取 {DATA_FILE} 失敗: {e}")
+
+    # 優先嘗試從 Google Sheet 同步最新商品
+    remote_products = sync_from_google_sheet()
+    if remote_products is not None:
+        products = remote_products
+
+    return settings, products, scheduled_tasks, custom_rules
 
 def save_config_and_products(settings: Dict[str, Any], products: List[Dict[str, Any]], scheduled_tasks: List[Dict[str, Any]] = None, custom_rules: List[Dict[str, Any]] = None):
     try:
@@ -513,6 +557,9 @@ async def main():
             else:
                 oos_found.append(p)
                 print(f"🔴【缺貨中】{p['name']} ({status_desc})")
+
+            # 雲端同步回寫 Google Sheet
+            sync_to_google_sheet(p, in_stock, status_desc, c_res.get("price", ""))
 
         # 2. 巡檢自訂萬用網頁爬蟲規則 (新購物網站 / 預約規則)
         for r in custom_rules:

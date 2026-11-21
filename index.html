@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>庫存監控與自動化工作台 - GitHub 雲端版</title>
+  <title>庫存監控與自動化工作台 - Google Sheet 雲端整合版</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <style>
@@ -14,31 +14,51 @@
 <body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col font-sans">
   <!-- 頂部導航 -->
   <header class="bg-slate-800/80 backdrop-blur border-b border-slate-700/60 sticky top-0 z-50">
-    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
       <div class="flex items-center space-x-3">
         <span class="text-2xl">🛒</span>
         <div>
           <h1 class="font-bold text-lg text-white leading-tight">好市多庫存監控雲端控制台</h1>
           <p class="text-xs text-emerald-400 flex items-center gap-1.5">
             <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
-            GitHub Actions 24/7 雲端巡檢中 (100% 免費·免綁信用卡)
+            <span id="syncModeIndicator">Google Sheet 雲端同步模式</span> · 24/7 自動巡檢
           </p>
         </div>
       </div>
-      <div class="flex items-center space-x-3 text-xs">
+      <div class="flex items-center space-x-2 text-xs">
+        <button id="btnOpenGasModal" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg flex items-center gap-1.5 transition shadow">
+          <i class="fas fa-table"></i> 設定 Google Sheet API
+        </button>
+        <button id="btnOpenHelpModal" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-lg flex items-center gap-1.5 transition shadow">
+          <i class="fas fa-circle-question"></i> 同步與權限說明
+        </button>
         <a id="ghActionsLink" href="https://github.com/jmscyc/inventory-notifier-agent/actions" target="_blank" 
            class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg flex items-center gap-1.5 transition shadow">
-          <i class="fab fa-github"></i> 雲端執行日誌
+          <i class="fab fa-github"></i> Actions 日誌
         </a>
         <a href="https://t.me/jmsaitry_bot" target="_blank" 
            class="px-3 py-1.5 bg-sky-500 hover:bg-sky-400 text-white rounded-lg flex items-center gap-1.5 transition shadow">
-          <i class="fab fa-telegram-plane"></i> 打開 Telegram
+          <i class="fab fa-telegram-plane"></i> Telegram
         </a>
       </div>
     </div>
   </header>
 
   <main class="max-w-6xl mx-auto px-4 py-6 flex-1 w-full space-y-6">
+    <!-- Google Sheet 狀態提示條 -->
+    <div id="gasStatusBanner" class="p-3.5 bg-slate-800/80 border border-emerald-500/30 rounded-xl flex items-center justify-between text-xs gap-3">
+      <div class="flex items-center gap-2">
+        <span id="gasStatusDot" class="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
+        <span id="gasStatusText" class="text-slate-200">正在檢查 Google Sheet 雲端連線狀態...</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <a id="btnOpenSheetLink" href="#" target="_blank" class="hidden px-2.5 py-1 bg-emerald-700/50 hover:bg-emerald-600/60 text-emerald-200 rounded border border-emerald-500/40 transition">
+          <i class="fas fa-arrow-up-right-from-square"></i> 開啟試算表
+        </a>
+        <button onclick="openGasModal()" class="text-indigo-400 hover:text-indigo-300 underline">變更網址</button>
+      </div>
+    </div>
+
     <!-- 雲端巡檢狀態卡片 -->
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
       <div class="bg-slate-800/90 border border-slate-700/70 p-4 rounded-xl flex items-center space-x-4">
@@ -81,7 +101,7 @@
           <h2 class="text-base font-bold text-white flex items-center gap-2">
             <i class="fas fa-cart-plus text-amber-400"></i> 新增商品監控
           </h2>
-          <p class="text-xs text-slate-400 mt-0.5">貼上 Costco 好市多線上購物商品網址即可納入雲端排程</p>
+          <p class="text-xs text-slate-400 mt-0.5">新增後自動寫入 Google Sheet 雲端資料庫，各端即時同步！</p>
         </div>
         <div class="flex gap-2">
           <button id="btnTriggerNow" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow">
@@ -90,37 +110,47 @@
         </div>
       </div>
 
-      <div class="flex flex-col sm:flex-row gap-3">
-        <input type="url" id="inputProductUrl" placeholder="例如：https://www.costco.com.tw/p/142997" 
-               class="flex-1 px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
-        <button id="btnAddProduct" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-semibold transition flex items-center justify-center gap-2 shadow">
-          <i class="fas fa-plus"></i> 加入監控清單
-        </button>
-      </div>
-
-      <!-- GitHub Token 說明 (只需一次輸入即可在網頁直接寫入 GitHub) -->
-      <div class="mt-4 pt-3 border-t border-slate-700/50 flex flex-col sm:flex-row items-start sm:items-center justify-between text-xs text-slate-400 gap-2">
-        <div class="flex items-center gap-1.5">
-          <i class="fas fa-key text-amber-400"></i>
-          <span>GitHub 個人授權碼 (可選，填入後可在本網頁直接新增商品與點擊立即檢查):</span>
+      <div class="grid grid-cols-1 md:grid-cols-12 gap-3">
+        <div class="md:col-span-6">
+          <input type="url" id="inputProductUrl" placeholder="商品網址，例如：https://www.costco.com.tw/p/142997" 
+                 class="w-full px-4 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
         </div>
-        <div class="flex gap-2 w-full sm:w-auto">
-          <input type="password" id="inputGhToken" placeholder="GitHub PAT (預設自動記住)" 
-                 class="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-xs text-slate-200 focus:outline-none w-full sm:w-48">
-          <button id="btnSaveToken" class="px-2.5 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white">記住</button>
+        <div class="md:col-span-2">
+          <input type="text" id="inputProductOption" placeholder="指定規格(如 L號/黑色)" 
+                 class="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
+        </div>
+        <div class="md:col-span-2">
+          <input type="number" id="inputProductPrice" placeholder="預算上限(元)" 
+                 class="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
+        </div>
+        <div class="md:col-span-2">
+          <button id="btnAddProduct" class="w-full h-full min-h-[40px] px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-semibold transition flex items-center justify-center gap-2 shadow">
+            <i class="fas fa-plus"></i> 加入監控
+          </button>
         </div>
       </div>
     </div>
 
     <!-- 追蹤商品列表 -->
     <div class="bg-slate-800/90 border border-slate-700/70 p-5 rounded-xl shadow-lg space-y-4">
-      <div class="flex items-center justify-between border-b border-slate-700/60 pb-3">
-        <h2 class="text-base font-bold text-white flex items-center gap-2">
-          <i class="fas fa-list-check text-indigo-400"></i> 監控中商品清單
-        </h2>
-        <button id="btnRefreshList" class="text-xs text-slate-400 hover:text-white flex items-center gap-1">
-          <i class="fas fa-rotate"></i> 重新載入清單
-        </button>
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-700/60 pb-3 gap-3">
+        <div class="flex items-center gap-3">
+          <h2 class="text-base font-bold text-white flex items-center gap-2">
+            <i class="fas fa-list-check text-indigo-400"></i> 監控中商品清單
+          </h2>
+          <div class="flex gap-1.5 text-xs">
+            <button onclick="filterItems('all')" id="filterAll" class="px-2.5 py-1 bg-indigo-600 text-white rounded font-medium">全部</button>
+            <button onclick="filterItems('in_stock')" id="filterInStock" class="px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded">現貨</button>
+            <button onclick="filterItems('oos')" id="filterOos" class="px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded">缺貨</button>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <input type="text" id="searchInput" oninput="handleSearch()" placeholder="搜尋品名或編號..." 
+                 class="px-3 py-1 bg-slate-900 border border-slate-700 rounded text-xs text-slate-200 placeholder-slate-500 focus:outline-none w-40 sm:w-52">
+          <button id="btnRefreshList" class="text-xs text-slate-400 hover:text-white flex items-center gap-1 px-2.5 py-1 bg-slate-800 rounded border border-slate-700">
+            <i class="fas fa-rotate"></i> 重新整理
+          </button>
+        </div>
       </div>
 
       <div id="productsContainer" class="space-y-3">
@@ -134,13 +164,124 @@
         <i class="fab fa-telegram text-sky-400 text-sm"></i> 💡 免開網頁！手機 Telegram 也能隨傳隨新增：
       </p>
       <p class="text-slate-300 leading-relaxed">
-        在外用手機看到想追蹤的好市多商品，直接將商品網址複製並傳送給您的機器人 
-        <a href="https://t.me/jmsaitry_bot" target="_blank" class="text-sky-400 underline font-bold">@jmsaitry_bot</a>，機器人會立即幫您記錄並排入雲端每 15 分鐘巡檢！
+        在外用手機看到想追蹤的好市多商品，直接將商品網址傳送給機器人 
+        <a href="https://t.me/jmsaitry_bot" target="_blank" class="text-sky-400 underline font-bold">@jmsaitry_bot</a>，機器人會立即記錄並同步至 Google Sheet，排入每 15 分鐘全自動巡檢！
       </p>
     </div>
   </main>
 
-  <!-- 提示彈窗 -->
+  <!-- 彈窗 1：設定 Google Sheet API 網址 -->
+  <div id="gasModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
+    <div class="bg-slate-800 border border-slate-700 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+      <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+        <h3 class="font-bold text-white text-base flex items-center gap-2">
+          <i class="fas fa-table text-emerald-400"></i> 設定 Google Sheet API 網址
+        </h3>
+        <button onclick="closeGasModal()" class="text-slate-400 hover:text-white"><i class="fas fa-xmark text-lg"></i></button>
+      </div>
+      <div class="text-xs text-slate-300 space-y-2 leading-relaxed">
+        <p>將此 Google Sheet 作為所有設備（手機、電腦、GitHub Actions）的中央資料庫，任何修改都會即時同步！</p>
+        <p class="text-amber-400">請貼上您在 Google Apps Script「部署為網路應用程式」所產生的 URL：</p>
+        <input type="url" id="inputGasUrlModal" placeholder="https://script.google.com/macros/s/AKfycb.../exec" 
+               class="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500">
+        
+        <p class="text-slate-400 pt-1">（選填）Google 試算表本身的網址（方便在控制台一鍵點開試算表）：</p>
+        <input type="url" id="inputSheetUrlModal" placeholder="https://docs.google.com/spreadsheets/d/.../edit" 
+               class="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-emerald-500">
+      </div>
+      <div class="pt-2 flex justify-between items-center">
+        <button onclick="openHelpModal(); closeGasModal();" class="text-xs text-indigo-400 hover:underline">
+          <i class="fas fa-question-circle"></i> 查看詳細設定教學
+        </button>
+        <div class="flex gap-2">
+          <button onclick="closeGasModal()" class="px-4 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-lg text-xs">取消</button>
+          <button onclick="saveGasSettings()" class="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold">儲存並連線</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 彈窗 2：完整同步與權限設定詳細教學 -->
+  <div id="helpModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50 hidden">
+    <div class="bg-slate-800 border border-slate-700 rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-4 max-h-[85vh] flex flex-col">
+      <div class="flex items-center justify-between border-b border-slate-700 pb-3">
+        <h3 class="font-bold text-white text-base flex items-center gap-2">
+          <i class="fas fa-book-open text-sky-400"></i> Google Sheet 權限設定與同步教學
+        </h3>
+        <button onclick="closeHelpModal()" class="text-slate-400 hover:text-white"><i class="fas fa-xmark text-lg"></i></button>
+      </div>
+      
+      <div class="text-xs text-slate-300 space-y-4 overflow-y-auto pr-2 leading-relaxed">
+        <div class="p-3 bg-indigo-950/40 border border-indigo-500/30 rounded-xl space-y-1">
+          <p class="font-bold text-indigo-300">💡 為什麼要結合 Google Sheet？</p>
+          <p class="text-slate-300">
+            資料不再只存在本地設備，而是直接放在您個人的 Google 雲端！試算表直覺好讀，手機開 Google 試算表 App 就能看；同時還能做為 API 讓 GitHub Actions 24/7 自動排程抓取與回寫！
+          </p>
+        </div>
+
+        <div class="space-y-3">
+          <div class="flex items-start gap-2.5">
+            <span class="w-5 h-5 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">1</span>
+            <div>
+              <p class="font-bold text-white">建立 Google 試算表</p>
+              <p class="text-slate-400">前往 Google 雲端硬碟建立一個新的試算表，命名為「電商庫存監控雲端資料庫」。</p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-2.5">
+            <span class="w-5 h-5 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">2</span>
+            <div>
+              <p class="font-bold text-white">貼入 Google Apps Script (GAS) 程式碼</p>
+              <p class="text-slate-400">在試算表上方選單點擊「擴充功能」 ➔ 「Apps Script」，將專案中的 <code class="text-indigo-300">GoogleAppsScript_Code.js</code> 內容全部複製並貼上取代原本的程式碼，按下 Ctrl+S 儲存。</p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-2.5">
+            <span class="w-5 h-5 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">3</span>
+            <div>
+              <p class="font-bold text-white">執行初始化設定</p>
+              <p class="text-slate-400">在 Apps Script 上方的函式下拉選單選擇 <code class="text-indigo-300">setupSheets</code>，點擊「執行」。(首次執行請點「審查權限」➔ 選擇您的 Google 帳號 ➔ 「進階」 ➔ 前往專案並允許)。執行後，系統會自動在試算表建立「商品清單」、「系統設定」與「巡檢日誌」三個分頁！</p>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-2.5">
+            <span class="w-5 h-5 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">4</span>
+            <div>
+              <p class="font-bold text-white">部署為網路應用程式 (關鍵權限設定 🔐)</p>
+              <p class="text-slate-400">點擊右上角藍色「部署」 ➔ 「新建部署」：</p>
+              <ul class="list-disc list-inside text-slate-300 mt-1 pl-2 space-y-0.5">
+                <li>種類選擇：<strong>網路應用程式 (Web App)</strong></li>
+                <li>說明：電商監控 API</li>
+                <li>執行身分：<strong>我 (您的 Google 帳號)</strong></li>
+                <li>誰可以存取：<strong class="text-emerald-400">任何人 (Anyone)</strong> (這樣網頁與 GitHub Actions 才能連線)</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="flex items-start gap-2.5">
+            <span class="w-5 h-5 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xs font-bold shrink-0 mt-0.5">5</span>
+            <div>
+              <p class="font-bold text-white">複製網址並填入本後台</p>
+              <p class="text-slate-400">複製部署完成產生的 Web App URL (結尾為 <code class="text-indigo-300">/exec</code>)，點擊本網頁右上角的「設定 Google Sheet API」貼上即可完成綁定！</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="p-3 bg-slate-900/60 border border-slate-700 rounded-xl space-y-1 text-slate-400">
+          <p class="font-bold text-slate-200">🔒 關於權限安全性的疑慮：</p>
+          <p>
+            「誰可以存取設為任何人」是 Google Apps Script 標準的公開 API 部署模式。他人並<strong>不會</strong>獲得您 Google 帳號的權限，也<strong>無法查看</strong>您的私人檔案，只能透過我們寫好的代碼針對這個特定的監控試算表進行讀寫，非常安全可靠！
+          </p>
+        </div>
+      </div>
+
+      <div class="pt-2 flex justify-end border-t border-slate-700">
+        <button onclick="closeHelpModal()" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold">我知道了</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 提示彈窗 Toast -->
   <div id="toast" class="fixed bottom-5 right-5 bg-slate-800 border border-slate-700 text-white text-xs px-4 py-3 rounded-lg shadow-xl hidden transition-all duration-300 z-50"></div>
 
   <script>
@@ -149,7 +290,10 @@
     const RAW_PRODUCTS_URL = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/tracked_products.json?t=${Date.now()}`;
     const GH_API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
 
+    let gasApiUrl = localStorage.getItem('gas_api_url') || '';
+    let sheetUrl = localStorage.getItem('sheet_url') || '';
     let currentProducts = [];
+    let currentFilter = 'all';
 
     function showToast(msg, isSuccess = true) {
       const toast = document.getElementById('toast');
@@ -158,16 +302,98 @@
       setTimeout(() => toast.classList.add('hidden'), 4000);
     }
 
+    function openGasModal() {
+      document.getElementById('inputGasUrlModal').value = gasApiUrl;
+      document.getElementById('inputSheetUrlModal').value = sheetUrl;
+      document.getElementById('gasModal').classList.remove('hidden');
+    }
+
+    function closeGasModal() {
+      document.getElementById('gasModal').classList.add('hidden');
+    }
+
+    function openHelpModal() {
+      document.getElementById('helpModal').classList.remove('hidden');
+    }
+
+    function closeHelpModal() {
+      document.getElementById('helpModal').classList.add('hidden');
+    }
+
+    document.getElementById('btnOpenGasModal').addEventListener('click', openGasModal);
+    document.getElementById('btnOpenHelpModal').addEventListener('click', openHelpModal);
+
+    function saveGasSettings() {
+      const val = document.getElementById('inputGasUrlModal').value.trim();
+      const sVal = document.getElementById('inputSheetUrlModal').value.trim();
+      gasApiUrl = val;
+      sheetUrl = sVal;
+      localStorage.setItem('gas_api_url', val);
+      localStorage.setItem('sheet_url', sVal);
+      closeGasModal();
+      showToast("已儲存 Google Sheet API 設定！重新載入資料中...", true);
+      updateBanner();
+      fetchProducts();
+    }
+
+    function updateBanner() {
+      const dot = document.getElementById('gasStatusDot');
+      const text = document.getElementById('gasStatusText');
+      const mode = document.getElementById('syncModeIndicator');
+      const sheetLink = document.getElementById('btnOpenSheetLink');
+
+      if (gasApiUrl) {
+        dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse";
+        text.innerHTML = `已連線 Google Sheet 雲端資料庫 (<span class="text-emerald-300 font-mono">${gasApiUrl.slice(0, 35)}...</span>)`;
+        mode.innerText = "Google Sheet 雲端同步模式";
+        if (sheetUrl) {
+          sheetLink.href = sheetUrl;
+          sheetLink.classList.remove('hidden');
+        } else {
+          sheetLink.classList.add('hidden');
+        }
+      } else {
+        dot.className = "w-2.5 h-2.5 rounded-full bg-amber-400";
+        text.innerHTML = `尚未設定 Google Sheet API（目前處於 GitHub 本地模式，點擊右方設定）`;
+        mode.innerText = "GitHub 本地模式";
+        sheetLink.classList.add('hidden');
+      }
+    }
+
     async function fetchProducts() {
+      const container = document.getElementById('productsContainer');
+      container.innerHTML = `
+        <div class="p-8 text-center text-slate-400 text-xs">
+          <i class="fas fa-spinner fa-spin text-lg text-indigo-400 mb-2"></i>
+          <p>正在同步雲端商品清單...</p>
+        </div>
+      `;
+
+      if (gasApiUrl) {
+        try {
+          const resp = await fetch(`${gasApiUrl}?action=getItems&t=${Date.now()}`);
+          const res = await resp.json();
+          if (res.success && Array.isArray(res.items)) {
+            currentProducts = res.items;
+            renderProducts(currentProducts);
+            return;
+          }
+        } catch (e) {
+          console.warn("GAS 讀取失敗，降級使用 GitHub 本地 JSON:", e);
+        }
+      }
+
+      // 降級讀取 GitHub 上的 tracked_products.json
       try {
         const resp = await fetch(RAW_PRODUCTS_URL);
         if (!resp.ok) throw new Error("讀取清單失敗");
-        currentProducts = await resp.json();
+        const data = await resp.json();
+        currentProducts = Array.isArray(data) ? data : (data.products || []);
         renderProducts(currentProducts);
       } catch (e) {
-        document.getElementById('productsContainer').innerHTML = `
+        container.innerHTML = `
           <div class="p-6 text-center text-slate-400 text-xs">
-            讀取商品清單失敗或清單為空。請稍候再試。
+            讀取商品清單失敗或清單為空。請點擊右上角設定 Google Sheet API 或檢查網路。
           </div>
         `;
       }
@@ -177,40 +403,59 @@
       const container = document.getElementById('productsContainer');
       document.getElementById('totalProductsCount').innerText = `${items.length} 件`;
 
-      if (!items || items.length === 0) {
+      let filtered = [...items];
+      if (currentFilter === 'in_stock') {
+        filtered = filtered.filter(it => it.in_stock);
+      } else if (currentFilter === 'oos') {
+        filtered = filtered.filter(it => !it.in_stock);
+      }
+
+      const q = document.getElementById('searchInput').value.trim().toLowerCase();
+      if (q) {
+        filtered = filtered.filter(it => 
+          (it.name && it.name.toLowerCase().includes(q)) || 
+          (it.id && it.id.toLowerCase().includes(q)) || 
+          (it.target_url && it.target_url.toLowerCase().includes(q))
+        );
+      }
+
+      if (filtered.length === 0) {
         container.innerHTML = `
           <div class="p-8 text-center text-slate-400 text-xs bg-slate-900/50 rounded-lg">
-            目前尚未加入任何商品。請在上方輸入框輸入 Costco 網址新增！
+            目前無符合條件的商品。請在上方輸入框輸入 Costco 網址新增！
           </div>
         `;
         return;
       }
 
-      container.innerHTML = items.map((item, index) => {
+      container.innerHTML = filtered.map((item, index) => {
         const inStock = item.in_stock;
         return `
           <div class="p-4 bg-slate-900/80 border ${inStock ? 'border-emerald-500/60 bg-emerald-950/20' : 'border-slate-700/60'} rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4 transition hover:border-slate-600">
             <div class="space-y-1.5 flex-1">
-              <div class="flex items-center gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
                 <span class="px-2 py-0.5 rounded text-xs font-bold ${inStock ? 'bg-emerald-600 text-white' : 'bg-slate-700 text-slate-300'}">
                   ${inStock ? '🟢 有現貨' : '🔴 目前缺貨'}
                 </span>
+                ${item.preferred_option ? `<span class="px-2 py-0.5 rounded text-xs bg-purple-900/50 text-purple-200 border border-purple-500/30">規格: ${item.preferred_option}</span>` : ''}
+                ${item.target_price ? `<span class="px-2 py-0.5 rounded text-xs bg-amber-900/50 text-amber-200 border border-amber-500/30">預算: $${item.target_price}</span>` : ''}
+                ${item.current_price ? `<span class="px-2 py-0.5 rounded text-xs bg-emerald-900/40 text-emerald-300 font-mono font-bold">${item.current_price}</span>` : ''}
                 <h3 class="text-sm font-semibold text-white line-clamp-1">${item.name || '商品名稱讀取中'}</h3>
               </div>
               <p class="text-xs text-slate-400 break-all">
-                <span class="text-slate-500">網址：</span><a href="${item.target_url}" target="_blank" class="text-indigo-400 hover:underline">${item.target_url}</a>
+                <span class="text-slate-500">網址：</span><a href="${item.target_url || item.url}" target="_blank" class="text-indigo-400 hover:underline">${item.target_url || item.url}</a>
               </p>
-              <div class="flex items-center gap-3 text-xs text-slate-500">
-                <span>狀態：${item.status_notes || '巡檢中'}</span>
+              <div class="flex items-center gap-3 text-xs text-slate-500 flex-wrap">
+                <span>狀態：${item.status_notes || item.last_status || '巡檢中'}</span>
                 <span>•</span>
                 <span>上次巡檢：${item.last_checked || '等待排程'}</span>
               </div>
             </div>
-            <div class="flex items-center gap-2 self-end md:self-center">
-              <a href="${item.target_url}" target="_blank" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-medium transition border border-slate-700">
+            <div class="flex items-center gap-2 self-end md:self-center shrink-0">
+              <a href="${item.target_url || item.url}" target="_blank" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-medium transition border border-slate-700">
                 <i class="fas fa-external-link-alt"></i> 前往商品
               </a>
-              <button onclick="removeProduct('${item.id || index}')" class="px-3 py-1.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 rounded-lg text-xs font-medium transition border border-rose-500/30">
+              <button onclick="removeProduct('${item.id || index}', '${item.target_url || item.url}')" class="px-3 py-1.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 rounded-lg text-xs font-medium transition border border-rose-500/30">
                 <i class="fas fa-trash-can"></i> 移除
               </button>
             </div>
@@ -219,116 +464,92 @@
       }).join('');
     }
 
-    async function removeProduct(id) {
-      const token = localStorage.getItem('gh_token') || document.getElementById('inputGhToken').value.trim();
-      if (!token) {
-        alert("請在下方填入您的 GitHub Token 才能直接在網頁修改儲存庫；或者直接在 GitHub 網頁編輯 tracked_products.json！");
-        return;
-      }
-      if (!confirm("確定要停止監控此商品嗎？")) return;
-
-      const filtered = currentProducts.filter(it => it.id !== id);
-      await commitUpdatedProducts(filtered, token, `Remove product ${id}`);
+    function filterItems(type) {
+      currentFilter = type;
+      document.getElementById('filterAll').className = type === 'all' ? 'px-2.5 py-1 bg-indigo-600 text-white rounded font-medium' : 'px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded';
+      document.getElementById('filterInStock').className = type === 'in_stock' ? 'px-2.5 py-1 bg-emerald-600 text-white rounded font-medium' : 'px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded';
+      document.getElementById('filterOos').className = type === 'oos' ? 'px-2.5 py-1 bg-rose-600 text-white rounded font-medium' : 'px-2.5 py-1 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded';
+      renderProducts(currentProducts);
     }
 
-    async function commitUpdatedProducts(newItems, token, commitMsg) {
-      try {
-        showToast("正在同步至 GitHub 雲端...", true);
-        // 先取得目前的 sha
-        const getFileResp = await fetch(`${GH_API_URL}/contents/tracked_products.json`, {
-          headers: { 'Authorization': `token ${token}` }
-        });
-        const fileData = await getFileResp.json();
-        const sha = fileData.sha;
+    function handleSearch() {
+      renderProducts(currentProducts);
+    }
 
-        const contentBase64 = btoa(unescape(encodeURIComponent(JSON.stringify(newItems, null, 2))));
-        const putResp = await fetch(`${GH_API_URL}/contents/tracked_products.json`, {
-          method: 'PUT',
-          headers: {
-            'Authorization': `token ${token}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            message: commitMsg,
-            content: contentBase64,
-            sha: sha
-          })
-        });
+    async function removeProduct(id, url) {
+      if (!confirm("確定要自雲端資料庫停止監控此商品嗎？")) return;
 
-        if (putResp.ok) {
-          showToast("✅ 成功更新至 GitHub！下次排程將生效", true);
-          currentProducts = newItems;
-          renderProducts(currentProducts);
-        } else {
-          throw new Error("更新失敗，請檢查 Token 權限！");
+      if (gasApiUrl) {
+        try {
+          showToast("正在自 Google Sheet 雲端移除...", true);
+          const resp = await fetch(gasApiUrl, {
+            method: 'POST',
+            body: JSON.stringify({ action: 'deleteItem', id: id, url: url })
+          });
+          const res = await resp.json();
+          if (res.success) {
+            showToast("✅ 已成功從 Google Sheet 移除！", true);
+            currentProducts = currentProducts.filter(it => it.id !== id && (it.target_url || it.url) !== url);
+            renderProducts(currentProducts);
+            return;
+          }
+        } catch (e) {
+          showToast("Google Sheet 移除失敗，請稍候再試", false);
         }
-      } catch (e) {
-        showToast(`❌ ${e.message}`, false);
+      } else {
+        alert("請先點擊右上角「設定 Google Sheet API」，才能享有跨設備直接刪除功能！");
       }
     }
 
     document.getElementById('btnAddProduct').addEventListener('click', async () => {
       const url = document.getElementById('inputProductUrl').value.trim();
+      const option = document.getElementById('inputProductOption').value.trim();
+      const price = document.getElementById('inputProductPrice').value.trim();
+
       if (!url.startsWith('http')) {
         alert("請輸入有效的商品網址！");
         return;
       }
 
-      const token = localStorage.getItem('gh_token') || document.getElementById('inputGhToken').value.trim();
-      if (!token) {
-        // 如果沒有 token，引導使用者直接跳轉到 GitHub 編輯
-        window.open(`https://github.com/${REPO_OWNER}/${REPO_NAME}/edit/main/tracked_products.json`, '_blank');
-        return;
+      if (gasApiUrl) {
+        try {
+          showToast("正在同步寫入 Google Sheet 雲端試算表...", true);
+          const matchCode = url.match(/\/p\/(\d+)/);
+          const code = matchCode ? matchCode[1] : Date.now();
+
+          const resp = await fetch(gasApiUrl, {
+            method: 'POST',
+            body: JSON.stringify({
+              action: 'addItem',
+              id: `item-${code}`,
+              url: url,
+              preferred_option: option,
+              target_price: price ? parseFloat(price) : null,
+              name: `好市多商品 (${code})`
+            })
+          });
+          const res = await resp.json();
+          if (res.success) {
+            showToast("🎉 已成功儲存至 Google Sheet！各設備立即同步", true);
+            document.getElementById('inputProductUrl').value = '';
+            document.getElementById('inputProductOption').value = '';
+            document.getElementById('inputProductPrice').value = '';
+            fetchProducts();
+            return;
+          } else {
+            throw new Error(res.message || "寫入失敗");
+          }
+        } catch (e) {
+          showToast(`❌ 寫入失敗: ${e.message}`, false);
+        }
+      } else {
+        openGasModal();
+        alert("💡 提示：請先在彈窗中設定 Google Sheet API 網址，這樣任何新增都會永久保存在您的 Google 雲端！");
       }
-
-      const matchCode = url.match(/\/p\/(\d+)/);
-      const code = matchCode ? matchCode[1] : Date.now();
-      const newItem = {
-        id: `item-${code}`,
-        name: `好市多商品 (${code})`,
-        target_url: url,
-        in_stock: false,
-        status_notes: "新加入待巡檢",
-        last_checked: ""
-      };
-
-      const updated = [...currentProducts, newItem];
-      await commitUpdatedProducts(updated, token, `Add new product ${code}`);
-      document.getElementById('inputProductUrl').value = '';
     });
 
     document.getElementById('btnTriggerNow').addEventListener('click', async () => {
-      const token = localStorage.getItem('gh_token') || document.getElementById('inputGhToken').value.trim();
-      if (!token) {
-        window.open(`https://github.com/${REPO_OWNER}/${REPO_NAME}/actions/workflows/inventory_monitor.yml`, '_blank');
-        return;
-      }
-      try {
-        showToast("正在喚醒 GitHub 雲端執行立即巡檢...", true);
-        const resp = await fetch(`${GH_API_URL}/actions/workflows/inventory_monitor.yml/dispatches`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `token ${token}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ ref: 'main' })
-        });
-        if (resp.status === 204) {
-          showToast("🎉 雲端機器人已啟動！10 秒後檢查 Telegram！", true);
-        } else {
-          throw new Error("觸發失敗");
-        }
-      } catch (e) {
-        showToast("觸發失敗，請檢查 Token 或直接在 GitHub 網頁點選 Run workflow", false);
-      }
-    });
-
-    document.getElementById('btnSaveToken').addEventListener('click', () => {
-      const val = document.getElementById('inputGhToken').value.trim();
-      if (val) {
-        localStorage.setItem('gh_token', val);
-        showToast("已成功記住 GitHub Token！", true);
-      }
+      window.open(`https://github.com/${REPO_OWNER}/${REPO_NAME}/actions/workflows/inventory_monitor.yml`, '_blank');
     });
 
     document.getElementById('btnRefreshList').addEventListener('click', () => {
@@ -337,8 +558,7 @@
     });
 
     // 初始化
-    const saved = localStorage.getItem('gh_token');
-    if (saved) document.getElementById('inputGhToken').value = saved;
+    updateBanner();
     fetchProducts();
   </script>
 </body>

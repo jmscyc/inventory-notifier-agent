@@ -686,7 +686,39 @@ SCHEDULER_STATUS = {
     "next_notify_seconds": 0,
 }
 
+def sync_from_google_sheet_local() -> Optional[list]:
+    """若設定了 GOOGLE_SHEET_API_URL，從 Google Sheet 優先同步最新商品清單"""
+    gs_url = os.getenv("GOOGLE_SHEET_API_URL", "").strip()
+    if not gs_url:
+        return None
+    try:
+        resp = httpx.get(f"{gs_url}?action=getItems&t={int(time.time())}", timeout=8.0, follow_redirects=True)
+        if resp.status_code == 200:
+            res_json = resp.json()
+            if res_json.get("success") and isinstance(res_json.get("items"), list):
+                return res_json["items"]
+    except Exception as e:
+        print(f"⚠️ 本地自 Google Sheet 同步失敗: {e}")
+    return None
+
+def sync_to_google_sheet_local(action: str, payload: dict):
+    """回寫商品新增/刪除/狀態至 Google Sheet"""
+    gs_url = os.getenv("GOOGLE_SHEET_API_URL", "").strip()
+    if not gs_url:
+        return
+    try:
+        body = dict(payload)
+        body["action"] = action
+        httpx.post(gs_url, json=body, timeout=8.0, follow_redirects=True)
+    except Exception as e:
+        print(f"⚠️ 本地回寫 Google Sheet 失敗 ({action}): {e}")
+
 def load_tracked_items() -> list:
+    # 優先從 Google Sheet 同步 (若有設定 GOOGLE_SHEET_API_URL)
+    remote = sync_from_google_sheet_local()
+    if remote is not None:
+        return remote
+
     if not DATA_FILE.exists():
         return []
     try:
@@ -694,7 +726,6 @@ def load_tracked_items() -> list:
             data = json.load(f)
             if isinstance(data, dict):
                 raw_prods = data.get("products", [])
-                # 標準化欄位：相容 target_url 與 url，以及 in_stock 與 last_status
                 normalized = []
                 for p in raw_prods:
                     if isinstance(p, dict):
@@ -784,13 +815,32 @@ def add_or_update_item(name: str, target_url: str, in_stock: bool, status_notes:
         items.append(new_entry)
 
     save_tracked_items(items)
+
+    # 同步回寫 Google Sheet
+    sync_to_google_sheet_local("addItem", {
+        "id": item_id,
+        "name": name,
+        "target_url": target_url,
+        "preferred_option": preferred_option,
+        "target_price": target_price,
+        "in_stock": in_stock,
+        "current_price": current_price,
+        "status_notes": status_notes
+    })
+
     return {"id": item_id, "name": name, "in_stock": in_stock}
 
 def delete_item(item_id: str) -> bool:
     items = load_tracked_items()
+    target_item = next((it for it in items if it.get("id") == item_id), None)
     new_items = [it for it in items if it.get("id") != item_id]
     if len(new_items) != len(items):
         save_tracked_items(new_items)
+        if target_item:
+            sync_to_google_sheet_local("deleteItem", {
+                "id": item_id,
+                "url": target_item.get("target_url") or target_item.get("url", "")
+            })
         return True
     return False
 

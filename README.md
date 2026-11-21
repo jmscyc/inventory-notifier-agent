@@ -99,6 +99,36 @@ uv run python3 telegram_bot_service.py
 
 ---
 
+## 📊 Google Sheet 雲端資料庫整合與權限教學 (跨設備 100% 同步)
+
+想要讓資料不再只存在自己的本機設備，而是與 Google 試算表即時連動，由手機、網頁後台、GitHub 雲端排程三方自動同步？請照以下步驟操作：
+
+### 🛠️ 5 步驟完成 Google Sheet 串接
+
+1. **建立 Google 試算表**：
+   - 進入您的 [Google 雲端硬碟](https://drive.google.com/)，建立一個空白「Google 試算表 (Google Sheets)」，命名為：`電商庫存監控雲端資料庫`。
+2. **複製 Apps Script 程式碼**：
+   - 在試算表上方選單點選 **「擴充功能」 ➔ 「Apps Script」**。
+   - 將專案中的 [`GoogleAppsScript_Code.js`](GoogleAppsScript_Code.js) 內容全部複製，貼上並覆蓋 Apps Script 編輯器中的所有代碼，按 `Ctrl+S` (或 `Cmd+S`) 儲存。
+3. **執行一次初始化建立工作表**：
+   - 在 Apps Script 頂部的函式下拉選單中選擇 **`setupSheets`**，點擊 **「執行」**。
+   - *首次執行會跳出「需要授權」提示，依序點擊「審查權限」➔ 選擇您的 Google 帳戶 ➔ 點擊左下角「進階」➔ 點擊「前往專案 (不安全)」➔ 點擊「允許」。*
+   - 執行成功後，回到試算表會發現自動建好了 **「商品清單」**、**「系統設定」** 與 **「巡檢日誌」** 三個分頁！
+4. **部署為網路應用程式 (關鍵權限設定 🔐)**：
+   - 點擊 Apps Script 右上角藍色 **「部署」 ➔ 「新建部署」**。
+   - 齒輪種類選擇：**「網路應用程式 (Web App)」**。
+   - 設定如下：
+     - **說明**：電商監控 API
+     - **執行身分**：`我 (您的 Google 帳戶)`
+     - **誰可以存取**：<span style="color:#10b981; font-weight:bold;">任何人 (Anyone)</span> *(⚠️ 必須選 Anyone，這樣網頁與 GitHub Actions 才能連線讀寫，他人無法查看您的 Google 帳號與其他私人檔案)*
+   - 點擊「部署」，完成後複製產生的 **「網路應用程式網址 (Web App URL)」** (網址以 `/exec` 結尾)。
+5. **貼入網頁後台或設定環境變數**：
+   - **線上網頁版**：打開 [admin.html](https://jmscyc.github.io/inventory-notifier-agent/admin.html)，點擊右上角 **「設定 Google Sheet API」** 貼上網址即可即時雙向連線！
+   - **地端本機版**：在 `.env` 中加入 `GOOGLE_SHEET_API_URL="您的_GAS_網址"`，本機新增/刪除商品會自動同步至試算表！
+   - **GitHub 24/7 巡檢**：在 GitHub 儲存庫 `Settings` ➔ `Secrets and variables` ➔ `Actions` 新增 Secret 名稱為 `GOOGLE_SHEET_API_URL`，雲端巡檢將優先自 Google Sheet 抓取最新商品並回寫現貨狀態！
+
+---
+
 ## 📂 檔案架構總覽 (File Structure)
 
 本專案奉行**「最小檔案數、最大聚合度」**之現代設計，避免分散雜亂：
@@ -114,6 +144,15 @@ inventory-notifier-agent/
 │                             • 萬用網頁爬蟲與 F12 規則測試 (Crawler & Rule Engine)
 │                             • 定時預約任務模組 (Scheduled Tasks)
 │                             • 價格歷史走勢時序數據庫存取
+│                             • Google Sheet 雲端雙向同步模組
+│
+├── GoogleAppsScript_Code.js  📊【Google Sheet 雲端資料庫後端 API】
+│                             • 提供 doGet / doPost REST API
+│                             • 自動維護商品清單、系統設定與 500 筆歷史日誌
+│
+├── admin.html / index.html   🌐【GitHub Pages 線上免電腦管理後台】
+│                             • 支援直接連線 Google Sheet API
+│                             • 支援商品篩選、狀態追蹤、手動即時觸發
 │
 ├── telegram_bot_service.py   ⭐【Telegram 行動機器人獨立服務】
 │                             • 底部 4 鍵常駐實體鍵盤
